@@ -44,6 +44,22 @@ class SearchCriteriaProfile(BaseModel):
         default_factory=list,
         description="Explicit user-added standing rules (e.g. 'Must have in-unit washer/dryer')",
     )
+    calibration_completed: bool = Field(
+        default=False,
+        description="True once the initial Top-10 calibration batch of active listings has been sent and baseline inventory marked seen.",
+    )
+    calibration_batch_size: int = Field(
+        default=10,
+        ge=1,
+        le=25,
+        description="Number of best active listings to send during initial calibration.",
+    )
+    max_alerts_per_scan: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum alerts sent in a single scan cycle so notifications are never overwhelming.",
+    )
     updated_at: str = Field(default_factory=utc_now_iso)
 
 

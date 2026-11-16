@@ -10,6 +10,7 @@ completely bypassing Cloudflare 403 blocks.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -19,7 +20,11 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from src.models import Listing
-from src.scrapers.base import BaseScraper, infer_ues_subneighborhood
+from src.scrapers.base import (
+    BaseScraper,
+    canonicalize_nyc_address_key,
+    infer_ues_subneighborhood,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +50,7 @@ class GroundedListingItem(BaseModel):
     )
     description: str = Field(
         ...,
-        description="Detailed description of the kitchen (island, breakfast bar, open concept) and natural light/exposures from the search result",
+        description="Detailed description of the kitchen (island, breakfast bar, open concept), layout, and natural light/exposures from the search result",
     )
     amenities: list[str] = Field(default_factory=list)
 
@@ -54,6 +59,18 @@ class GroundedListingBatch(BaseModel):
     """Batch of live UES 3+ BR rental listings returned from Google Search."""
 
     listings: list[GroundedListingItem] = Field(default_factory=list)
+
+
+SEARCH_AREA_FOCUSES = (
+    (
+        "Carnegie Hill & Upper East Side (East 78th Street to East 96th Street, Fifth/Madison/Park/Lexington/Third Ave)",
+        "site:streeteasy.com/building OR site:streeteasy.com/rental Carnegie Hill Upper East Side 3 bedroom for rent island OR high floor",
+    ),
+    (
+        "Lenox Hill & Yorkville (East 59th Street to East 78th Street, plus East End/York/First/Second Ave up to 96th St)",
+        "site:streeteasy.com/building OR site:compass.com Lenox Hill Yorkville Upper East Side 3 bedroom 4 bedroom rental open kitchen",
+    ),
+)
 
 
 class GeminiSearchUESScraper(BaseScraper):
@@ -71,23 +88,21 @@ class GeminiSearchUESScraper(BaseScraper):
         self.model = model
         self._client = genai.Client(api_key=api_key) if api_key else None
 
-    async def fetch_listings(self) -> list[Listing]:
+    def _run_grounded_query_sync(self, area_label: str, search_hint: str) -> list[GroundedListingItem]:
         if not self._client:
-            logger.info("[GeminiSearchUESScraper] Skipped (GEMINI_API_KEY not configured)")
             return []
+        prompt = f"""Use Google Search (suggested query focus: {search_hint}) to find currently active 3+ bedroom (3 bed, 4 bed) apartment rentals in {area_label} on StreetEasy, Compass, Corcoran, Douglas Elliman, or RentHop (priced up to $25,000/month).
 
-        prompt = """Use Google Search to find currently active 3+ bedroom (3 bed, 4 bed) apartment rentals in Manhattan's Upper East Side, Carnegie Hill, Yorkville, and Lenox Hill on StreetEasy, Compass, RentHop, Corcoran, or Douglas Elliman.
-
-Focus especially on listings that mention:
-- Open kitchen, center island, waterfall island, or breakfast bar flowing into the living room
+Prioritize real active listings that feature:
+- Open-concept kitchen, center island, waterfall island, or breakfast bar flowing into the living room
 - High floor, corner unit, sunny, sun-flooded, or South/East/West exposure
-- Located between East 59th Street and East 96th Street (Upper East Side, Carnegie Hill, Yorkville, Lenox Hill)
+- Generous family layout (3+ bedrooms, 2+ bathrooms)
 
-Return up to 12 real, distinct rental listings with their actual street address, unit number, monthly rent price, bedroom/bathroom count, URL, floor/exposure info, and detailed description of the kitchen and natural light.
+Return up to 12 real, currently active, distinct rental listings with their exact street address, unit number, monthly rent price, bedroom/bathroom count, direct URL, floor/exposure info, and detailed description of the kitchen, layout, and natural light.
 Format your response ONLY as a valid JSON object matching this exact structure:
-{
+{{
   "listings": [
-    {
+    {{
       "source": "StreetEasy",
       "url": "https://...",
       "address": "200 East 79th Street",
@@ -98,64 +113,77 @@ Format your response ONLY as a valid JSON object matching this exact structure:
       "bathrooms": 3,
       "sqft": 1950,
       "floor_info": "14th Floor, Corner South/East Exposure",
-      "description": "Full details of kitchen island, layout, and light...",
+      "description": "Full details of kitchen island, layout, bedrooms, and light...",
       "amenities": ["Doorman", "Elevator", "Washer/Dryer"]
-    }
+    }}
   ]
-}"""
-
-        try:
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    tools=[types.Tool(google_search=types.GoogleSearch())],
-                ),
-            )
-            raw_text = (response.text or "").strip()
-            if not raw_text:
-                return []
-
-            # Extract JSON block from response text
-            json_str = self._extract_json_object(raw_text)
-            if not json_str:
-                logger.warning("[GeminiSearchUESScraper] Could not extract JSON block from grounded search")
-                return []
-
-            batch = GroundedListingBatch.model_validate_json(json_str)
-            results: dict[str, Listing] = {}
-            for item in batch.listings:
-                if item.bedrooms < 3 or item.price <= 0 or not item.address:
-                    continue
-                slug_base = f"{item.address}-{item.unit}".lower()
-                slug = re.sub(r"[^a-z0-9]+", "-", slug_base).strip("-")
-                listing_id = f"gsearch:{slug}"
-                neigh = infer_ues_subneighborhood(item.address, item.neighborhood)
-                results[listing_id] = Listing(
-                    listing_id=listing_id,
-                    source=item.source or "StreetEasy/Web",
-                    url=item.url if item.url.startswith("http") else "https://streeteasy.com/for-rent/upper-east-side/beds>=3",
-                    address=item.address,
-                    unit=item.unit,
-                    neighborhood=neigh,
-                    price=item.price,
-                    bedrooms=item.bedrooms,
-                    bathrooms=item.bathrooms,
-                    sqft=item.sqft,
-                    floor_info=item.floor_info,
-                    description=item.description,
-                    amenities=item.amenities,
-                )
-
-            logger.info(
-                "[GeminiSearchUESScraper] Discovered %d live UES 3+ BR listings via Google Search Grounding",
-                len(results),
-            )
-            return list(results.values())
-        except Exception as exc:
-            logger.error("[GeminiSearchUESScraper] Search grounding error: %s", exc)
+}}"""
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+        raw_text = (response.text or "").strip()
+        if not raw_text:
             return []
+        json_str = self._extract_json_object(raw_text)
+        if not json_str:
+            logger.warning("[GeminiSearchUESScraper] Could not extract JSON block for %s", area_label)
+            return []
+        batch = GroundedListingBatch.model_validate_json(json_str)
+        return batch.listings
+
+    async def fetch_listings(self) -> list[Listing]:
+        if not self._client:
+            logger.info("[GeminiSearchUESScraper] Skipped (GEMINI_API_KEY not configured)")
+            return []
+
+        results: dict[str, Listing] = {}
+        for idx, (area_label, search_hint) in enumerate(SEARCH_AREA_FOCUSES):
+            if idx > 0:
+                await asyncio.sleep(2.0)
+            try:
+                items = await asyncio.to_thread(
+                    self._run_grounded_query_sync, area_label, search_hint
+                )
+                for item in items:
+                    if item.bedrooms < 3 or item.price <= 0 or not item.address:
+                        continue
+                    canon_key = canonicalize_nyc_address_key(item.address, item.unit, item.url)
+                    if not canon_key:
+                        continue
+                    listing_id = f"gsearch:{canon_key}"
+                    neigh = infer_ues_subneighborhood(item.address, item.neighborhood)
+                    results[listing_id] = Listing(
+                        listing_id=listing_id,
+                        source=item.source or "StreetEasy",
+                        url=(
+                            item.url
+                            if item.url.startswith("http")
+                            else "https://streeteasy.com/for-rent/upper-east-side/beds>=3"
+                        ),
+                        address=item.address,
+                        unit=item.unit,
+                        neighborhood=neigh,
+                        price=item.price,
+                        bedrooms=item.bedrooms,
+                        bathrooms=item.bathrooms,
+                        sqft=item.sqft,
+                        floor_info=item.floor_info,
+                        description=item.description,
+                        amenities=item.amenities,
+                    )
+            except Exception as exc:
+                logger.error("[GeminiSearchUESScraper] Search grounding error (%s): %s", area_label, exc)
+
+        logger.info(
+            "[GeminiSearchUESScraper] Discovered %d live UES 3+ BR listings via Google Search Grounding",
+            len(results),
+        )
+        return list(results.values())
 
     @staticmethod
     def _extract_json_object(text: str) -> str | None:

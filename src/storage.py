@@ -23,6 +23,7 @@ from src.models import (
     SearchCriteriaProfile,
     utc_now_iso,
 )
+from src.scrapers.base import canonicalize_nyc_address_key
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,35 @@ class StorageBackend(ABC):
     @abstractmethod
     def is_listing_seen(self, listing_id: str) -> bool:
         """Return True if this listing_id has already been evaluated."""
+
+    @abstractmethod
+    def get_seen_identifiers(self) -> tuple[set[str], set[str]]:
+        """Return (seen_listing_ids, seen_canonical_address_keys) for fast cross-portal deduplication."""
+
+    def save_baseline_seen_listing(self, listing: Listing, reason: str) -> None:
+        """
+        Mark an existing active listing as baseline-seen without invoking Gemini so it
+        will never re-appear as 'new' on future scans.
+        """
+        stub_eval = EvaluationResult(
+            meets_all_criteria=False,
+            has_open_island_or_breakfast_bar=False,
+            has_high_natural_light=False,
+            is_target_ues_location=False,
+            passes_learned_feedback_rules=True,
+            disqualifiers_detected=[reason],
+            overall_score=0,
+            kitchen_points=0,
+            light_points=0,
+            layout_points=0,
+            learned_preference_points=0,
+            light_analysis="Baselined during calibration pre-filter.",
+            kitchen_analysis="Baselined during calibration pre-filter.",
+            reasoning_summary=f"Baselined existing listing ({reason}).",
+        )
+        self.save_evaluated_listing(
+            EvaluatedListing(listing=listing, evaluation=stub_eval, alerted=False)
+        )
 
     @abstractmethod
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
@@ -266,6 +296,22 @@ class LocalJSONStorage(StorageBackend):
         state = self._read_state()
         return listing_id in state["listings"]
 
+    def get_seen_identifiers(self) -> tuple[set[str], set[str]]:
+        state = self._read_state()
+        seen_ids: set[str] = set()
+        seen_addr_keys: set[str] = set()
+        for lid, raw in state["listings"].items():
+            seen_ids.add(lid)
+            listing_raw = raw.get("listing") or {}
+            key = canonicalize_nyc_address_key(
+                str(listing_raw.get("address") or ""),
+                str(listing_raw.get("unit") or ""),
+                str(listing_raw.get("url") or ""),
+            )
+            if key:
+                seen_addr_keys.add(key)
+        return seen_ids, seen_addr_keys
+
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
         state = self._read_state()
         state["listings"][evaluated.listing.listing_id] = evaluated.model_dump()
@@ -295,6 +341,7 @@ class LocalJSONStorage(StorageBackend):
             EvaluatedListing.model_validate(raw)
             for raw in state["listings"].values()
         ]
+        items = [item for item in items if item.evaluation.overall_score > 0]
         items.sort(key=lambda x: x.evaluation.overall_score, reverse=True)
         return items[:limit]
 
@@ -395,14 +442,18 @@ class LocalJSONStorage(StorageBackend):
 
     def get_stats(self) -> dict[str, int]:
         state = self._read_state()
-        listings = state["listings"].values()
+        listings = list(state["listings"].values())
         feedback = [
             f
             for k, f in state["feedback"].items()
             if k != SYSTEM_CRITERIA_ROW_ID
         ]
         return {
-            "total_evaluated": len(listings),
+            "total_evaluated": sum(
+                1
+                for item in listings
+                if int((item.get("evaluation") or {}).get("overall_score", 0)) > 0
+            ),
             "total_alerted": sum(1 for item in listings if item.get("alerted")),
             "yes_votes": sum(1 for f in feedback if f.get("vote") == "YES"),
             "no_votes": sum(1 for f in feedback if f.get("vote") == "NO"),
@@ -445,6 +496,27 @@ class SupabaseStorage(StorageBackend):
         )
         resp.raise_for_status()
         return len(resp.json()) > 0
+
+    def get_seen_identifiers(self) -> tuple[set[str], set[str]]:
+        resp = self._client.get(
+            f"{self.rest_url}/listings",
+            params={"select": "listing_id,address,unit,url", "limit": "2000"},
+        )
+        resp.raise_for_status()
+        seen_ids: set[str] = set()
+        seen_addr_keys: set[str] = set()
+        for row in resp.json():
+            lid = str(row.get("listing_id") or "")
+            if lid:
+                seen_ids.add(lid)
+            key = canonicalize_nyc_address_key(
+                str(row.get("address") or ""),
+                str(row.get("unit") or ""),
+                str(row.get("url") or ""),
+            )
+            if key:
+                seen_addr_keys.add(key)
+        return seen_ids, seen_addr_keys
 
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
         listing = evaluated.listing
@@ -536,7 +608,12 @@ class SupabaseStorage(StorageBackend):
     def get_top_evaluated_listings(self, limit: int = 5) -> list[EvaluatedListing]:
         resp = self._client.get(
             f"{self.rest_url}/listings",
-            params={"select": "*", "order": "overall_score.desc", "limit": str(limit)},
+            params={
+                "select": "*",
+                "overall_score": "gt.0",
+                "order": "overall_score.desc",
+                "limit": str(limit),
+            },
         )
         resp.raise_for_status()
         return [self._row_to_evaluated_listing(r) for r in resp.json()]

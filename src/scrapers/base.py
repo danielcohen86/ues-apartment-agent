@@ -73,6 +73,61 @@ def infer_ues_subneighborhood(address: str, raw_neighborhood: str = "") -> str:
     return "Upper East Side"
 
 
+def canonicalize_nyc_address_key(address: str, unit: str = "", url: str = "") -> str:
+    """
+    Build a canonical NYC building+unit fingerprint so identical apartments across scans
+    or portals (e.g. '200 East 79th Street #14B' vs '200 E. 79 St Apt 14B') resolve to
+    the exact same key and are never re-sent as 'new'.
+    """
+    addr = (address or "").lower().strip()
+    # Strip borough/city/state/zip noise
+    addr = re.sub(
+        r"\b(?:new\s+york|manhattan|nyc|ny|10021|10028|10128|10065|10075|10029|10044)\b",
+        " ",
+        addr,
+    )
+    # Extract embedded unit if present in address (e.g., "200 East 79th St #14B" or "Apt 14B")
+    embedded_unit = ""
+    emb_match = re.search(
+        r"(?:,\s*|\s+)(?:#|apt\.?\s*|apartment\s*|unit\s*|residence\s*)([a-z0-9-]+)\s*$",
+        addr,
+        re.I,
+    )
+    if emb_match:
+        embedded_unit = emb_match.group(1)
+        addr = addr[: emb_match.start()].strip()
+
+    # Normalize directional & street tokens
+    addr = re.sub(r"\be\.?(?=\s|\d)", "east ", addr)
+    addr = re.sub(r"\bw\.?(?=\s|\d)", "west ", addr)
+    addr = re.sub(r"\b(\d+)(?:st|nd|rd|th)\b", r"\1", addr)
+    addr = re.sub(r"\b(?:st|str)\.?\b", "street", addr)
+    addr = re.sub(r"\b(?:ave|av)\.?\b", "avenue", addr)
+    addr = re.sub(r"\bblvd\.?\b", "boulevard", addr)
+    addr = re.sub(r"\bpl\.?\b", "place", addr)
+
+    unit_raw = (unit or embedded_unit or "").lower().strip()
+    unit_raw = re.sub(
+        r"^(?:#|apt\.?\s*|apartment\s*|unit\s*|residence\s*|res\.?\s*)+",
+        "",
+        unit_raw,
+    )
+    unit_clean = re.sub(r"[^a-z0-9]+", "", unit_raw)
+    addr_clean = re.sub(r"[^a-z0-9]+", "-", addr).strip("-")
+
+    # Fallback to StreetEasy building/unit URL path if address was generic
+    if (not addr_clean or addr_clean in ("upper-east-side", "carnegie-hill", "yorkville", "lenox-hill")) and url:
+        se_match = re.search(r"streeteasy\.com/building/([a-z0-9_-]+)/([a-z0-9_-]+)", url.lower())
+        if se_match:
+            bldg_slug = se_match.group(1).replace("-new_york", "").replace("_", "-")
+            u_slug = re.sub(r"[^a-z0-9]+", "", se_match.group(2))
+            return f"{bldg_slug}-{u_slug}".strip("-")
+
+    if not addr_clean:
+        return ""
+    return f"{addr_clean}-{unit_clean}" if unit_clean else addr_clean
+
+
 class BaseScraper(ABC):
     """Abstract base class for Upper East Side rental scrapers."""
 

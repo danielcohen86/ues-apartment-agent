@@ -104,16 +104,16 @@ def build_actions_menu_keyboard() -> InlineKeyboardMarkup:
     """Build 1-tap interactive buttons for /actions capability menu."""
     keyboard = [
         [
-            InlineKeyboardButton("🔍 Run Scan Now", callback_data="act|scan"),
-            InlineKeyboardButton("🏆 Top 5 Ranked", callback_data="act|top"),
+            InlineKeyboardButton("🎯 Calibrate (Top 10 Active)", callback_data="act|calibrate"),
+            InlineKeyboardButton("🔍 Scan New Only", callback_data="act|scan"),
         ],
         [
             InlineKeyboardButton("⚙️ View / Edit Criteria", callback_data="act|criteria"),
             InlineKeyboardButton("🧠 Learned Memory", callback_data="act|memory"),
         ],
         [
+            InlineKeyboardButton("🏆 Top 5 Ranked", callback_data="act|top"),
             InlineKeyboardButton("📊 Agent Status", callback_data="act|status"),
-            InlineKeyboardButton("🧪 Send Test Alert", callback_data="act|test_alert"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -174,6 +174,7 @@ def format_telegram_alert_html(
     evaluated: EvaluatedListing,
     rank_index: int | None = None,
     total_qualified: int | None = None,
+    is_calibration: bool = False,
 ) -> str:
     """
     Format a qualifying UES listing into a ranked HTML Telegram card with explicit rubric breakdown.
@@ -203,7 +204,12 @@ def format_telegram_alert_html(
         else f"{listing.bathrooms}"
     )
 
-    if rank_index is not None and total_qualified is not None and total_qualified > 0:
+    if is_calibration and rank_index is not None and total_qualified is not None and total_qualified > 0:
+        header = (
+            f"🎯 <b>CALIBRATION #{rank_index} OF {total_qualified} BEST ACTIVE "
+            f"— {ev.overall_score}/100 PTS</b>"
+        )
+    elif rank_index is not None and total_qualified is not None and total_qualified > 0:
         header = (
             f"🏆 <b>RANK #{rank_index} OF {total_qualified} QUALIFYING MATCHES "
             f"— {ev.overall_score}/100 PTS</b>"
@@ -234,11 +240,25 @@ def format_telegram_alert_html(
         f"☀️ <b>Floor &amp; Exposure:</b> {floor_safe}",
         "",
         rubric_line,
-        "",
-        f"🍳 <b>Open Island / Breakfast Bar Check:</b>\n{kitchen_safe}",
-        "",
-        f"🔆 <b>Natural Light Check:</b>\n{light_safe}",
     ]
+
+    if is_calibration and ev.disqualifiers_detected:
+        caveat_str = html.escape("; ".join(ev.disqualifiers_detected[:2]))
+        lines.extend(
+            [
+                "",
+                f"ℹ️ <b>Calibration Note:</b> <i>Included in Top {total_qualified or 10} active options for rating ({caveat_str}).</i>",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            f"🍳 <b>Open Island / Breakfast Bar Check:</b>\n{kitchen_safe}",
+            "",
+            f"🔆 <b>Natural Light Check:</b>\n{light_safe}",
+        ]
+    )
 
     if pros_lines:
         lines.extend(["", f"✨ <b>Standout Highlights:</b>\n{pros_lines}"])
@@ -264,11 +284,13 @@ class TelegramAgentBot:
         storage: StorageBackend,
         evaluator: GeminiListingEvaluator,
         on_manual_scan: Callable[[], Awaitable[dict[str, int] | int]] | None = None,
+        on_calibrate: Callable[[], Awaitable[dict[str, int]]] | None = None,
     ) -> None:
         self.config = config
         self.storage = storage
         self.evaluator = evaluator
         self.on_manual_scan = on_manual_scan
+        self.on_calibrate = on_calibrate
         self.app: Application | None = None
 
         if config.telegram_bot_token:
@@ -287,8 +309,9 @@ class TelegramAgentBot:
             await self.app.bot.set_my_commands(
                 [
                     BotCommand("actions", "List all agent capabilities & 1-tap actions"),
+                    BotCommand("calibrate", "Send Top 10 best active listings to rate & baseline inventory"),
                     BotCommand("criteria", "View & adjust search criteria (beds, baths, rent, rules)"),
-                    BotCommand("scan", "Run an immediate scan & rank qualifying apartments"),
+                    BotCommand("scan", "Scan for brand-new qualifying apartments"),
                     BotCommand("top", "Show Top 5 highest-ranked apartments evaluated so far"),
                     BotCommand("memory", "View learned YES/NO feedback rules injected into Gemini"),
                     BotCommand("status", "Check agent health, stats & scan schedule"),
@@ -315,6 +338,7 @@ class TelegramAgentBot:
     def _register_handlers(self, app: Application) -> None:
         app.add_handler(CommandHandler(["actions", "help"], self.cmd_actions))
         app.add_handler(CommandHandler(["start", "status"], self.cmd_status))
+        app.add_handler(CommandHandler("calibrate", self.cmd_calibrate))
         app.add_handler(CommandHandler("criteria", self.cmd_criteria))
         app.add_handler(CommandHandler("set", self.cmd_set_criteria))
         app.add_handler(CommandHandler("add_rule", self.cmd_add_rule))
@@ -343,12 +367,30 @@ class TelegramAgentBot:
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_feedback)
         )
 
+    async def send_info_message(
+        self, text_html: str, target_chat_id: int | None = None
+    ) -> None:
+        """Send an informational HTML status banner to the configured Telegram chat."""
+        chat_id = target_chat_id or self.config.telegram_allowed_chat_id
+        if not self.app or chat_id is None:
+            return
+        try:
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=text_html,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:
+            logger.error("Failed sending info banner to Telegram: %s", exc)
+
     async def send_high_conviction_alert(
         self,
         evaluated: EvaluatedListing,
         target_chat_id: int | None = None,
         rank_index: int | None = None,
         total_qualified: int | None = None,
+        is_calibration: bool = False,
     ) -> int | None:
         """Send a ranked qualifying listing alert with [ YES 👍 ] and [ NO 👎 ] inline buttons."""
         chat_id = target_chat_id or self.config.telegram_allowed_chat_id
@@ -364,7 +406,10 @@ class TelegramAgentBot:
             return None
 
         text_html = format_telegram_alert_html(
-            evaluated, rank_index=rank_index, total_qualified=total_qualified
+            evaluated,
+            rank_index=rank_index,
+            total_qualified=total_qualified,
+            is_calibration=is_calibration,
         )
         reply_markup = build_feedback_keyboard(evaluated.listing.listing_id)
 
@@ -395,9 +440,10 @@ class TelegramAgentBot:
     def _format_actions_text() -> str:
         return (
             "🤖 <b>UES Family Rental Agent — Capabilities &amp; Commands</b>\n\n"
-            "<b>1. 🔍 Search &amp; Ranked Discovery</b>\n"
-            "• /scan — Scan StreetEasy (via Google Search), Craigslist NYC, RentHop &amp; NYBits right now. "
-            "Shows <b>100% of apartments meeting your criteria</b>, ranked #1 to #N.\n"
+            "<b>1. 🎯 Calibration &amp; New-Listings-Only Discovery</b>\n"
+            "• /calibrate — Send the <b>Top 10 best active listings</b> right now for you to rate "
+            "and mark all existing inventory as seen so you only get <b>brand-new</b> listings going forward.\n"
+            "• /scan — Scan for brand-new apartments meeting 100% of your criteria, ranked #1 to #N.\n"
             "• /top — View the Top 5 highest-ranked apartments evaluated so far.\n"
             "• /test_alert — Send a sample Carnegie Hill 3BR card to test feedback buttons.\n\n"
             "<b>2. ⚙️ View &amp; Adjust Search Criteria</b>\n"
@@ -416,7 +462,7 @@ class TelegramAgentBot:
             "• <code>/add_rule &lt;rule text&gt;</code> — Explicitly add a custom standing rule.\n"
             "• <code>/remove_rule &lt;#&gt;</code> — Delete a learned rule or custom rule by number.\n\n"
             "<b>4. 📊 System Health</b>\n"
-            "• /status — View database stats, vote counts, and scan schedule."
+            "• /status — View database stats, calibration state, vote counts, and scan schedule."
         )
 
     def _format_criteria_html(self) -> tuple[str, SearchCriteriaProfile]:
@@ -681,7 +727,9 @@ class TelegramAgentBot:
         action = (query.data or "").split("|", 1)[-1]
         await query.answer()
 
-        if action == "scan":
+        if action == "calibrate":
+            await self._execute_calibrate(update.effective_chat.id)
+        elif action == "scan":
             await self._execute_scan_and_reply(update.effective_chat.id)
         elif action == "top":
             await self._send_top_evaluated(update.effective_chat.id)
@@ -710,6 +758,18 @@ class TelegramAgentBot:
         elif action == "test_alert":
             await self.cmd_test_alert(update, context)
 
+    async def _execute_calibrate(self, chat_id: int) -> None:
+        """Run the Top-10 active listings calibration workflow."""
+        if not self.on_calibrate:
+            return
+        await self.on_calibrate()
+
+    async def cmd_calibrate(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /calibrate command: send Top 10 best active listings & baseline existing inventory."""
+        if not self._is_authorized(update) or not update.effective_chat:
+            return
+        await self._execute_calibrate(update.effective_chat.id)
+
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start and /status commands."""
         if not self._is_authorized(update) or not update.effective_chat:
@@ -717,16 +777,22 @@ class TelegramAgentBot:
         stats = self.storage.get_stats()
         criteria = self.storage.get_criteria_profile()
         hoods = ", ".join(criteria.neighborhoods)
+        cal_str = (
+            "✅ Calibrated — Sending Brand-New Listings Only"
+            if criteria.calibration_completed
+            else f"⏳ Initial Top-{criteria.calibration_batch_size} Calibration Pending"
+        )
         msg = (
             "🏛️ <b>UES Family Rental Agent — Active</b>\n\n"
+            f"• <b>Mode:</b> {cal_str}\n"
             f"• <b>Target Areas:</b> {html.escape(hoods)}\n"
             f"• <b>Min Size:</b> {criteria.min_bedrooms:g}+ BR / {criteria.min_bathrooms:g}+ BA\n"
             f"• <b>Max Rent:</b> ${criteria.max_monthly_rent:,}/month\n"
-            "• <b>Selection Policy:</b> Shows <b>100% of apartments meeting your active + learned criteria</b>, ranked #1 to #N\n"
+            "• <b>Selection Policy:</b> Shows <b>100% of new apartments meeting your active + learned criteria</b>, ranked #1 to #N\n"
             f"• <b>Scan Interval:</b> Every {self.config.scan_interval_minutes} mins\n\n"
             "📈 <b>Memory &amp; Scan Stats:</b>\n"
             f"• Listings Evaluated: <b>{stats['total_evaluated']}</b>\n"
-            f"• Qualifying Alerts Sent: <b>{stats['total_alerted']}</b>\n"
+            f"• Alerts Sent: <b>{stats['total_alerted']}</b>\n"
             f"• Training Votes: <b>{stats['yes_votes']} YES 👍</b> | <b>{stats['no_votes']} NO 👎</b> "
             f"(<b>{stats['feedback_with_reasons']}</b> detailed reasons learned)\n\n"
             "💡 Send <b>/actions</b> for all capabilities or <b>/criteria</b> to view/edit your filters."

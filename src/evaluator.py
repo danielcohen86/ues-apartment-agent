@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -191,16 +192,31 @@ class GeminiListingEvaluator:
             if media_parts:
                 contents.extend(media_parts)
 
-            response = self._client.models.generate_content(
-                model=self.config.gemini_model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                    response_schema=EvaluationResult,
-                ),
-            )
-            if not response.text:
+            response = None
+            for attempt in range(2):
+                try:
+                    response = self._client.models.generate_content(
+                        model=self.config.gemini_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            temperature=0.1,
+                            response_mime_type="application/json",
+                            response_schema=EvaluationResult,
+                        ),
+                    )
+                    break
+                except Exception as api_exc:
+                    err_str = str(api_exc)
+                    if attempt == 0 and ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str):
+                        logger.info(
+                            "Gemini free-tier RPM limit hit for %s; pausing 6s before retry...",
+                            listing.listing_id,
+                        )
+                        time.sleep(6.0)
+                        continue
+                    raise
+
+            if not response or not response.text:
                 raise RuntimeError("Empty response from Gemini API")
 
             result = EvaluationResult.model_validate_json(response.text)
@@ -268,8 +284,6 @@ class GeminiListingEvaluator:
             and len(result.disqualifiers_detected) == 0
         )
         result.meets_all_criteria = qualifies
-        if not qualifies:
-            result.overall_score = min(result.overall_score, 68)
         return result
 
     def _heuristic_fallback_evaluate(
@@ -418,9 +432,8 @@ class GeminiListingEvaluator:
             and len(disqualifiers) == 0
         )
 
-        total_score = kitchen_pts + light_pts + layout_pts + learned_pts
+        total_score = max(0, min(100, kitchen_pts + light_pts + layout_pts + learned_pts))
         if not qualifies:
-            total_score = min(65, total_score)
             cons.extend(disqualifiers)
             summary = (
                 f"Did not meet all criteria ({total_score}/100): "

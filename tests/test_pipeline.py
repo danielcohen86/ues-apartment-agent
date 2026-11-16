@@ -283,3 +283,89 @@ async def test_end_to_end_demo_scan_cycle_and_ranked_delivery(tmp_path: Path) ->
     report2 = await runner.run_scan_cycle(dry_run=True)
     assert report2.already_seen_count == 3
     assert report2.high_conviction_alerts_sent == 0
+
+
+@pytest.mark.asyncio
+async def test_top_10_calibration_batch_then_new_listings_only(tmp_path: Path) -> None:
+    from src.scrapers.base import BaseScraper, canonicalize_nyc_address_key
+
+    # Verify NYC street & unit canonicalizer collapses StreetEasy / web formatting variations
+    assert canonicalize_nyc_address_key("200 East 79th Street", "#14B") == canonicalize_nyc_address_key(
+        "200 E. 79 St., Manhattan", "Apt 14B"
+    )
+    assert canonicalize_nyc_address_key("1185 Park Avenue", "Residence 15B") == canonicalize_nyc_address_key(
+        "1185 Park Ave, New York, NY 10128", "#15B"
+    )
+
+    class StaticInventoryScraper(BaseScraper):
+        source_name = "Test-StreetEasy"
+
+        def __init__(self, items: list[Listing]) -> None:
+            super().__init__()
+            self.items = items
+
+        async def fetch_listings(self) -> list[Listing]:
+            return list(self.items)
+
+    # Create 15 currently active UES 3BR listings
+    active_inventory = [
+        Listing(
+            listing_id=f"se:active-{i}",
+            source="StreetEasy",
+            url=f"https://streeteasy.com/rental/{1000 + i}",
+            address=f"{100 + i} East 82nd Street",
+            unit=f"#{10 + (i % 8)}A",
+            neighborhood="Upper East Side",
+            price=12000 + i * 250,
+            bedrooms=3.0,
+            bathrooms=2.5,
+            sqft=1850 + i * 20,
+            floor_info="High Floor South Exposure",
+            description="Sun-flooded corner 3BR with open-concept chef's kitchen and waterfall island.",
+        )
+        for i in range(15)
+    ]
+
+    config = make_test_config(tmp_path)
+    storage = LocalJSONStorage(config.local_storage_path)
+    scraper = StaticInventoryScraper(active_inventory)
+    runner = UESRentalAgentRunner(config=config, storage=storage, scrapers=[scraper])
+
+    assert storage.get_criteria_profile().calibration_completed is False
+
+    # 1. Calibration sends ONLY the Top 10 best active listings (not all 15) and baselines all 15 as seen
+    cal_report = await runner.run_calibration_batch(limit=10, dry_run=True)
+    assert cal_report["scraped_count"] == 15
+    assert cal_report["calibration_sent"] == 10
+    assert cal_report["baselined_total"] == 15
+    assert storage.get_criteria_profile().calibration_completed is True
+
+    # 2. Next scan has the 15 existing apartments (with slightly altered address formatting on #0) + 1 brand-new listing
+    reformatted_existing_0 = active_inventory[0].model_copy(
+        update={
+            "listing_id": "gsearch:variant-id",
+            "address": "100 E. 82 St, Manhattan",
+            "unit": "Apt 10A",
+        }
+    )
+    brand_new_listing = Listing(
+        listing_id="se:brand-new-999",
+        source="StreetEasy",
+        url="https://streeteasy.com/rental/9999",
+        address="1150 Fifth Avenue",
+        unit="#16C",
+        neighborhood="Carnegie Hill",
+        price=16500,
+        bedrooms=3.0,
+        bathrooms=3.0,
+        sqft=2200,
+        floor_info="16th Floor Corner",
+        description="Brand new to market! Sun-drenched 3BR with open kitchen and center island.",
+    )
+    scraper.items = [reformatted_existing_0, *active_inventory[1:], brand_new_listing]
+
+    scan_report = await runner.run_scan_cycle(dry_run=True)
+    assert scan_report.already_seen_count == 15
+    assert scan_report.gemini_evaluated_count == 1
+    assert scan_report.high_conviction_alerts_sent == 1
+

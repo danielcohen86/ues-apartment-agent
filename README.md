@@ -17,14 +17,19 @@ A **100% free, zero-spam, background-running real estate agent** engineered spec
      - Windowed pass-throughs / wall cut-outs without an actual island or breakfast bar flow.
      - Dark lower floors (1st–3rd floor, courtyard/airshaft facing) or dark interior hallways.
 
-2. **Low-Noise / High-Conviction Policy (`>= 85/100`)**:
+2. **StreetEasy-Exclusive Sourcing + Calibrated 100-Point Ranking Rubric (`25 / 25 / 25 / 25`)**:
+   - **Source**: Scrapes **StreetEasy exclusively** (filtering out out-of-neighborhood `?infeed=1` ads and cross-referencing verified StreetEasy `washer_dryer` and `doorman` filters).
    - **Stage-1 Deterministic Filter** (`src/filters.py`) immediately drops non-UES listings, `< 3 BR` units, and unambiguous galley/low-floor units at zero API cost.
-   - **Stage-2 Gemini Multimodal Evaluation** (`src/evaluator.py`) inspects the listing text, floorplan, and photos using `gemini-2.5-flash` (Free Tier) and scores the candidate from `0–100`.
-   - Only properties scoring **85/100 or higher** with `has_open_island_or_breakfast_bar=True`, `has_high_natural_light=True`, and zero disqualifiers trigger a Telegram notification.
+   - **Stage-2 Gemini 3.6 Flash Vision Evaluation** (`src/evaluator.py`) inspects high-resolution (`960px`) StreetEasy gallery photos, floorplan slides, and NYC floor height signals across an equal **100-point rubric**:
+     - **Kitchen & Island Flow**: `0–25 pts`
+     - **Natural Light & Exposure**: `0–25 pts`
+     - **Family Layout & Size**: `0–25 pts`
+     - **Learned Preference Fit**: `0–25 pts`
+   - **Top-10 Active Calibration -> New-Listings-Only Mode**: Sends the Top 10 best currently active StreetEasy listings once to calibrate your ratings, baselines 100% of active StreetEasy inventory as `seen`, and thereafter alerts **only** on brand-new StreetEasy listings meeting 100% of active + learned criteria.
 
 3. **Active Training Loop (`[ YES 👍 ]` / `[ NO 👎 ]` + Voice/Text Memory Injection)**:
    - Every Telegram alert includes two inline buttons: **`[ YES 👍 ]`** and **`[ NO 👎 ]`**.
-   - Clicking **`[ NO 👎 ]`** prompts you for a quick **text message or voice note** (e.g., *"Pass-through isn't open enough"* or *"Bedrooms look too small"*). Voice notes are automatically transcribed via Gemini 2.5 Flash audio understanding.
+   - Clicking **`[ NO 👎 ]`** offers 1-tap quick reasons plus **text message or voice note** capture (e.g., *"Pass-through isn't open enough"* or *"Bedrooms look too small"*), transcribed via Gemini multimodal audio.
    - All feedback is persisted in your database (**Supabase Free Tier PostgreSQL** or **Local JSON store**) and dynamically injected into the `ACTIVE TRAINING MEMORY` section of every subsequent Gemini prompt.
 
 ---
@@ -64,13 +69,17 @@ Edit `.env` and add:
   cp deploy/com.ues.apartment-agent.plist ~/Library/LaunchAgents/
   launchctl load ~/Library/LaunchAgents/com.ues.apartment-agent.plist
   ```
-- **Render Background Worker**:
+- **Render Free Web Service**:
   Push this repository to GitHub and connect it to Render as a Blueprint (`render.yaml`).
 
 ---
 
 ## Telegram Bot Commands
-- `/status` — View scanned count, high-conviction alerts sent, and learned feedback rules.
+- `/actions` — Interactive menu of all agent capabilities and 1-tap shortcuts.
+- `/calibrate` — Send the Top 10 best active StreetEasy listings to rate and baseline current inventory as seen.
+- `/criteria` — View and adjust active search filters (beds, baths, max rent, sqft, island, light, standing rules).
+- `/scan` — Trigger an immediate scan on StreetEasy for brand-new qualifying apartments.
+- `/top` — View the Top 5 highest-ranked StreetEasy apartments evaluated so far.
 - `/memory` — Inspect the live Active Training Memory log injected into Gemini prompts.
-- `/scan` — Trigger an immediate on-demand scan across UES / Carnegie Hill / Yorkville / Lenox Hill.
-- `/test_alert` — Send a sample high-conviction Carnegie Hill 3BR card with `[ YES 👍 ]` and `[ NO 👎 ]` buttons to test the feedback loop on your phone.
+- `/status` — View calibration state, StreetEasy scan stats, and learned feedback counts.
+- `/test_alert` — Send a sample Carnegie Hill 3BR card with `[ YES 👍 ]` and `[ NO 👎 ]` buttons.

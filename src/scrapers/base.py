@@ -73,6 +73,82 @@ def infer_ues_subneighborhood(address: str, raw_neighborhood: str = "") -> str:
     return "Upper East Side"
 
 
+def _ordinal(n: int) -> str:
+    if 10 <= (n % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def infer_nyc_floor_from_unit(unit: str, context_text: str = "") -> tuple[int | None, str]:
+    """
+    Infer floor number and human-readable floor label from NYC unit designators
+    (e.g. '#27F6' -> 27th Floor, '#2102' -> 21st Floor, '#804' -> 8th Floor, '#PHB' -> Penthouse).
+    """
+    combined = f"{unit} {context_text}".lower()
+    raw = re.sub(
+        r"^(?:#|apt\.?\s*|apartment\s*|unit\s*|residence\s*|res\.?\s*|fl\.?\s*|floor\s*)+",
+        "",
+        (unit or "").strip(),
+        flags=re.I,
+    ).strip()
+
+    if not raw:
+        return None, ""
+
+    if re.match(r"^(?:ph[-a-z0-9]*|penthouse\b)", raw, re.I) or "penthouse" in combined:
+        return 30, "Penthouse (Top Floor)"
+
+    if re.match(r"^(?:th[-a-z0-9]*|townhouse\b)", raw, re.I) or "townhouse" in combined:
+        return None, "Townhouse / Multi-Floor"
+
+    if re.match(r"^(?:g\d*|garden|bsmt|basement|cellar|parlor)$", raw, re.I):
+        if "parlor" in raw.lower():
+            return 2, "Parlor Floor"
+        return 1, "Garden / Ground Floor"
+
+    # Multi-floor duplex unit: #10/11J -> 10th/11th Floor Duplex
+    m_duplex = re.match(r"^0?(\d{1,2})/0?(\d{1,2})[A-Za-z0-9-]*$", raw)
+    if m_duplex:
+        f1, f2 = int(m_duplex.group(1)), int(m_duplex.group(2))
+        top_fl = max(f1, f2)
+        if 1 <= top_fl <= 90:
+            return top_fl, f"{_ordinal(f1)}/{_ordinal(f2)} Floor Duplex"
+
+    # Standard NYC alphanumeric floor+line: #27B, #27F6, #19B, #4C, #12-A
+    m_alpha = re.match(r"^0?(\d{1,2})[-]?[A-Za-z][A-Za-z0-9]*$", raw)
+    if m_alpha:
+        fl = int(m_alpha.group(1))
+        if 1 <= fl <= 90:
+            return fl, f"{_ordinal(fl)} Floor"
+
+    # 4-digit high-rise unit: #2102 -> 21st Floor, #1405 -> 14th Floor
+    m_four = re.match(r"^(\d{2})(\d{2})[A-Za-z]?$", raw)
+    if m_four:
+        fl = int(m_four.group(1))
+        line_num = int(m_four.group(2))
+        if 10 <= fl <= 85 and 0 <= line_num <= 40:
+            return fl, f"{_ordinal(fl)} Floor"
+
+    # 3-digit unit: #804 -> 8th Floor, #201 -> 2nd Floor
+    m_three = re.match(r"^([1-9])(\d{2})[A-Za-z]?$", raw)
+    if m_three:
+        fl = int(m_three.group(1))
+        line_num = int(m_three.group(2))
+        if 0 <= line_num <= 40:
+            return fl, f"{_ordinal(fl)} Floor"
+
+    # Whole-floor unit: Floor 14 or #14
+    m_plain = re.match(r"^(\d{1,2})$", raw)
+    if m_plain:
+        fl = int(m_plain.group(1))
+        if 1 <= fl <= 85:
+            return fl, f"{_ordinal(fl)} Floor"
+
+    return None, ""
+
+
 def canonicalize_nyc_address_key(address: str, unit: str = "", url: str = "") -> str:
     """
     Build a canonical NYC building+unit fingerprint so identical apartments across scans

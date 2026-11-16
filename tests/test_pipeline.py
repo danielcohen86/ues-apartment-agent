@@ -368,4 +368,121 @@ async def test_top_10_calibration_batch_then_new_listings_only(tmp_path: Path) -
     assert scan_report.already_seen_count == 15
     assert scan_report.gemini_evaluated_count == 1
     assert scan_report.high_conviction_alerts_sent == 1
+    assert storage.get_criteria_profile().streeteasy_calibration_v2_completed is True
+
+
+def test_streeteasy_jina_markdown_parser_and_sponsored_filter() -> None:
+    from src.scrapers.base import infer_nyc_floor_from_unit
+    from src.scrapers.streeteasy import StreetEasyUESScraper, split_streeteasy_title_address_and_unit
+
+    assert infer_nyc_floor_from_unit("#27F6") == (27, "27th Floor")
+    assert infer_nyc_floor_from_unit("#2102") == (21, "21st Floor")
+    assert infer_nyc_floor_from_unit("#PHB") == (30, "Penthouse (Top Floor)")
+    assert infer_nyc_floor_from_unit("#10/11J") == (11, "10th/11th Floor Duplex")
+    assert split_streeteasy_title_address_and_unit(
+        "340 East 64th Street #10/11J", "https://streeteasy.com/building/st-tropez/1011j"
+    ) == ("340 East 64th Street", "#10/11J")
+
+    sample_md = """
+# 60 All Upper East Side, Manhattan NY Apartments for Rent under $25,000
+
+*   
+Condo in Lenox Hill
+
+[400 East 67th Street #27B](https://streeteasy.com/building/the-laurel/27b?featured=1)  Save Listing actions    $20,500 base rent  **$19,200** net effective base rent
+
+1 month free·12-month lease
+
+    *   3 beds
+    *   3.5 baths
+    *   1,964 ft²
+
+Listing by Douglas Elliman
+
+[![Image 6: 400 East 67th Street image 20 of 20](https://photos.zillowstatic.com/fp/aaaa1111bbbb2222cccc3333dddd4444-p_e.webp)![Image 7: 400 East 67th Street image 1 of 20](https://photos.zillowstatic.com/fp/11112222333344445555666677778888-p_e.webp)![Image 8: 400 East 67th Street image 2 of 20](https://photos.zillowstatic.com/fp/99998888777766665555444433332222-p_e.webp)previous next 3D tour](https://streeteasy.com/building/the-laurel/27b?featured=1)Image 1 of 20
+
+*   
+Rental unit in East Harlem · Sponsored
+
+[205 East 110th Street #9A](https://streeteasy.com/building/205-east-110th-street/9a?infeed=1)  Save Listing actions    $8,900 base rent
+
+    *   3 beds
+    *   2 baths
+    *   1,200 ft²
+"""
+    scraper = StreetEasyUESScraper(min_bedrooms=3.0, min_bathrooms=2.0, max_monthly_rent=25000)
+    listings, total_expected = scraper.parse_jina_markdown(sample_md)
+
+    assert total_expected == 60
+    assert len(listings) == 1
+    item = listings[0]
+    assert item.source == "StreetEasy"
+    assert item.listing_id == "se:the-laurel-27b"
+    assert item.url == "https://streeteasy.com/building/the-laurel/27b"
+    assert item.address == "400 East 67th Street"
+    assert item.unit == "#27B"
+    assert item.neighborhood == "Lenox Hill"
+    assert item.price == 20500
+    assert item.bedrooms == 3.0
+    assert item.bathrooms == 3.5
+    assert item.sqft == 1964
+    assert item.floor_info == "27th Floor"
+    assert item.floorplan_urls == [
+        "https://photos.zillowstatic.com/fp/aaaa1111bbbb2222cccc3333dddd4444-cc_ft_960.webp"
+    ]
+    assert len(item.image_urls) == 2
+    assert all(u.endswith("-cc_ft_960.webp") for u in item.image_urls)
+
+
+@pytest.mark.asyncio
+async def test_streeteasy_only_runner_purges_legacy_craigslist_and_upgrades_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.scrapers.streeteasy import StreetEasyUESScraper
+
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("ENABLE_DEMO_MODE", "false")
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setenv("LOCAL_STORAGE_PATH", "test_prod.json")
+    env_cfg = AgentConfig.from_env()
+    assert env_cfg.gemini_model == "gemini-3.6-flash"
+
+    prod_cfg = AgentConfig(
+        gemini_api_key="",
+        gemini_model="gemini-3.6-flash",
+        storage_backend="local",
+        local_storage_path=tmp_path / "purge_test.json",
+        enable_demo_mode=False,
+    )
+    storage = LocalJSONStorage(prod_cfg.local_storage_path)
+    prod_runner = UESRentalAgentRunner(config=prod_cfg, storage=storage)
+    assert len(prod_runner.scrapers) == 1
+    assert isinstance(prod_runner.scrapers[0], StreetEasyUESScraper)
+
+    # Seed a legacy Craigslist row from old v1 calibration
+    legacy_cl = Listing(
+        listing_id="cl:legacy-1",
+        source="Craigslist-NYC",
+        url="https://newyork.craigslist.org/mnh/apa/d/1.html",
+        address="300 East 85th Street",
+        unit="#4A",
+        neighborhood="Yorkville",
+        price=9500,
+        bedrooms=3.0,
+        bathrooms=2.0,
+        description="Craigslist post",
+    )
+    storage.save_evaluated_listing(
+        EvaluatedListing(
+            listing=legacy_cl,
+            evaluation=prod_runner.evaluator.evaluate_listing(legacy_cl),
+            alerted=True,
+        )
+    )
+    assert storage.is_listing_seen("cl:legacy-1") is True
+    assert storage.get_top_evaluated_listings(limit=10) == []
+    purged = storage.purge_non_streeteasy_listings()
+    assert purged == 1
+    assert storage.is_listing_seen("cl:legacy-1") is False
+
 

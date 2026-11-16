@@ -48,6 +48,10 @@ class SearchCriteriaProfile(BaseModel):
         default=False,
         description="True once the initial Top-10 calibration batch of active listings has been sent and baseline inventory marked seen.",
     )
+    streeteasy_calibration_v2_completed: bool = Field(
+        default=False,
+        description="True once the StreetEasy-exclusive v2 calibration batch has purged legacy sources and sent Top-10 StreetEasy listings.",
+    )
     calibration_batch_size: int = Field(
         default=10,
         ge=1,

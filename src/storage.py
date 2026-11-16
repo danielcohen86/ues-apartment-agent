@@ -61,6 +61,10 @@ class StorageBackend(ABC):
     def get_seen_identifiers(self) -> tuple[set[str], set[str]]:
         """Return (seen_listing_ids, seen_canonical_address_keys) for fast cross-portal deduplication."""
 
+    @abstractmethod
+    def purge_non_streeteasy_listings(self) -> int:
+        """Delete any stored listings not sourced from StreetEasy and return count removed."""
+
     def save_baseline_seen_listing(self, listing: Listing, reason: str) -> None:
         """
         Mark an existing active listing as baseline-seen without invoking Gemini so it
@@ -312,6 +316,19 @@ class LocalJSONStorage(StorageBackend):
                 seen_addr_keys.add(key)
         return seen_ids, seen_addr_keys
 
+    def purge_non_streeteasy_listings(self) -> int:
+        state = self._read_state()
+        non_se_ids = [
+            lid
+            for lid, raw in state["listings"].items()
+            if str((raw.get("listing") or {}).get("source") or "") != "StreetEasy"
+        ]
+        if non_se_ids:
+            for lid in non_se_ids:
+                del state["listings"][lid]
+            self._write_state(state)
+        return len(non_se_ids)
+
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
         state = self._read_state()
         state["listings"][evaluated.listing.listing_id] = evaluated.model_dump()
@@ -341,7 +358,11 @@ class LocalJSONStorage(StorageBackend):
             EvaluatedListing.model_validate(raw)
             for raw in state["listings"].values()
         ]
-        items = [item for item in items if item.evaluation.overall_score > 0]
+        items = [
+            item
+            for item in items
+            if item.listing.source == "StreetEasy" and item.evaluation.overall_score > 0
+        ]
         items.sort(key=lambda x: x.evaluation.overall_score, reverse=True)
         return items[:limit]
 
@@ -518,6 +539,15 @@ class SupabaseStorage(StorageBackend):
                 seen_addr_keys.add(key)
         return seen_ids, seen_addr_keys
 
+    def purge_non_streeteasy_listings(self) -> int:
+        resp = self._client.delete(
+            f"{self.rest_url}/listings",
+            params={"source": "neq.StreetEasy"},
+        )
+        resp.raise_for_status()
+        deleted = resp.json() if resp.content else []
+        return len(deleted) if isinstance(deleted, list) else 0
+
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
         listing = evaluated.listing
         ev = evaluated.evaluation
@@ -610,6 +640,7 @@ class SupabaseStorage(StorageBackend):
             f"{self.rest_url}/listings",
             params={
                 "select": "*",
+                "source": "eq.StreetEasy",
                 "overall_score": "gt.0",
                 "order": "overall_score.desc",
                 "limit": str(limit),

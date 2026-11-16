@@ -35,7 +35,7 @@ class AgentConfig:
 
     # AI Engine (Gemini Free Tier)
     gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.6-flash"
 
     # Notification UI (Telegram Bot API)
     telegram_bot_token: str = ""
@@ -71,7 +71,15 @@ class AgentConfig:
         if gemini_api_key == "your_gemini_api_key_here":
             gemini_api_key = ""
 
-        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+        raw_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip() or "gemini-3.6-flash"
+        if raw_model.startswith(("gemini-2.5", "gemini-2.0", "gemini-1.5")):
+            logging.info(
+                "Upgrading deprecated GEMINI_MODEL '%s' to live multimodal 'gemini-3.6-flash'.",
+                raw_model,
+            )
+            gemini_model = "gemini-3.6-flash"
+        else:
+            gemini_model = raw_model
 
         telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if telegram_bot_token == "your_telegram_bot_token_here":

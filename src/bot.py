@@ -439,12 +439,12 @@ class TelegramAgentBot:
     @staticmethod
     def _format_actions_text() -> str:
         return (
-            "🤖 <b>UES Family Rental Agent — Capabilities &amp; Commands</b>\n\n"
-            "<b>1. 🎯 Calibration &amp; New-Listings-Only Discovery</b>\n"
-            "• /calibrate — Send the <b>Top 10 best active listings</b> right now for you to rate "
-            "and mark all existing inventory as seen so you only get <b>brand-new</b> listings going forward.\n"
-            "• /scan — Scan for brand-new apartments meeting 100% of your criteria, ranked #1 to #N.\n"
-            "• /top — View the Top 5 highest-ranked apartments evaluated so far.\n"
+            "🤖 <b>UES Family Rental Agent — StreetEasy Capabilities &amp; Commands</b>\n\n"
+            "<b>1. 🎯 StreetEasy Calibration &amp; New-Listings-Only Discovery</b>\n"
+            "• /calibrate — Send the <b>Top 10 best active StreetEasy listings</b> right now for you to rate "
+            "and mark all existing StreetEasy inventory as seen so you only get <b>brand-new</b> listings going forward.\n"
+            "• /scan — Scan StreetEasy for brand-new apartments meeting 100% of your criteria, ranked #1 to #N.\n"
+            "• /top — View the Top 5 highest-ranked StreetEasy apartments evaluated so far.\n"
             "• /test_alert — Send a sample Carnegie Hill 3BR card to test feedback buttons.\n\n"
             "<b>2. ⚙️ View &amp; Adjust Search Criteria</b>\n"
             "• /criteria — View all active filters (Min Beds, Min Baths, Max Rent, Min SqFt, Neighborhoods, "
@@ -777,18 +777,22 @@ class TelegramAgentBot:
         stats = self.storage.get_stats()
         criteria = self.storage.get_criteria_profile()
         hoods = ", ".join(criteria.neighborhoods)
+        is_calibrated = bool(
+            criteria.calibration_completed and criteria.streeteasy_calibration_v2_completed
+        )
         cal_str = (
-            "✅ Calibrated — Sending Brand-New Listings Only"
-            if criteria.calibration_completed
-            else f"⏳ Initial Top-{criteria.calibration_batch_size} Calibration Pending"
+            "✅ Calibrated on StreetEasy — Sending Brand-New StreetEasy Listings Only"
+            if is_calibrated
+            else f"⏳ StreetEasy Top-{criteria.calibration_batch_size} Calibration Pending"
         )
         msg = (
-            "🏛️ <b>UES Family Rental Agent — Active</b>\n\n"
+            "🏛️ <b>UES Family Rental Agent — Active (StreetEasy Exclusive)</b>\n\n"
+            f"• <b>Source:</b> StreetEasy Only (100% Verified UES Inventory)\n"
             f"• <b>Mode:</b> {cal_str}\n"
             f"• <b>Target Areas:</b> {html.escape(hoods)}\n"
             f"• <b>Min Size:</b> {criteria.min_bedrooms:g}+ BR / {criteria.min_bathrooms:g}+ BA\n"
             f"• <b>Max Rent:</b> ${criteria.max_monthly_rent:,}/month\n"
-            "• <b>Selection Policy:</b> Shows <b>100% of new apartments meeting your active + learned criteria</b>, ranked #1 to #N\n"
+            "• <b>Selection Policy:</b> Shows <b>100% of new StreetEasy apartments meeting your active + learned criteria</b>, ranked #1 to #N\n"
             f"• <b>Scan Interval:</b> Every {self.config.scan_interval_minutes} mins\n\n"
             "📈 <b>Memory &amp; Scan Stats:</b>\n"
             f"• Listings Evaluated: <b>{stats['total_evaluated']}</b>\n"
@@ -823,8 +827,8 @@ class TelegramAgentBot:
         await self.app.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"🔍 Scanning StreetEasy (via Google Search), Craigslist NYC, RentHop &amp; NYBits "
-                f"for <b>{criteria.min_bedrooms:g}+ BR / {criteria.min_bathrooms:g}+ BA</b> homes "
+                f"🔍 Scanning <b>StreetEasy</b> exclusively "
+                f"for brand-new <b>{criteria.min_bedrooms:g}+ BR / {criteria.min_bathrooms:g}+ BA</b> homes "
                 f"(up to <b>${criteria.max_monthly_rent:,}/mo</b>) in "
                 f"{html.escape(', '.join(criteria.neighborhoods))}..."
             ),

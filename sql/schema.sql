@@ -42,7 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_listings_neighborhood ON public.listings (neighbo
 -- 2. User Feedback & Active Training Memory Log
 CREATE TABLE IF NOT EXISTS public.feedback_memory (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    listing_id TEXT NOT NULL REFERENCES public.listings(listing_id) ON DELETE CASCADE,
+    listing_id TEXT NOT NULL,
     vote TEXT NOT NULL CHECK (vote IN ('YES', 'NO')),
     reason TEXT DEFAULT '',
     feedback_source TEXT NOT NULL DEFAULT 'inline_button', -- 'inline_button', 'text_reply', 'voice_note'
@@ -58,7 +58,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_memory_unique_listing ON public.f
 -- 3. Pending Feedback State (Tracks when user clicks [ NO 👎 ] awaiting text/voice explanation)
 CREATE TABLE IF NOT EXISTS public.pending_feedback_prompts (
     chat_id BIGINT PRIMARY KEY,
-    listing_id TEXT NOT NULL REFERENCES public.listings(listing_id) ON DELETE CASCADE,
+    listing_id TEXT NOT NULL,
     prompt_message_id BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

@@ -14,6 +14,8 @@ from src.filters import prefilter_listing
 from src.models import EvaluatedListing, Listing
 from src.scrapers import (
     BaseScraper,
+    CraigslistUESScraper,
+    GeminiSearchUESScraper,
     MockUESScraper,
     NYBitsUESScraper,
     RentHopUESScraper,
@@ -55,6 +57,10 @@ class UESRentalAgentRunner:
             self.scrapers = [MockUESScraper()]
         else:
             self.scrapers = [
+                GeminiSearchUESScraper(
+                    api_key=config.gemini_api_key, model=config.gemini_model
+                ),
+                CraigslistUESScraper(),
                 StreetEasyUESScraper(),
                 RentHopUESScraper(),
                 NYBitsUESScraper(),
@@ -68,9 +74,16 @@ class UESRentalAgentRunner:
         )
         self._stop_event = asyncio.Event()
 
-    async def _manual_scan_From_telegram(self) -> int:
+    async def _manual_scan_From_telegram(self) -> dict[str, int]:
         report = await self.run_scan_cycle()
-        return report.high_conviction_alerts_sent
+        return {
+            "scraped_count": report.scraped_count,
+            "already_seen_count": report.already_seen_count,
+            "prefilter_rejected_count": report.prefilter_rejected_count,
+            "gemini_evaluated_count": report.gemini_evaluated_count,
+            "below_threshold_count": report.below_threshold_count,
+            "high_conviction_alerts_sent": report.high_conviction_alerts_sent,
+        }
 
     async def collect_candidates(self) -> list[Listing]:
         """Run all configured scrapers concurrently and deduplicate by listing_id."""

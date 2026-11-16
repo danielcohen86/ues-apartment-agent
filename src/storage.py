@@ -68,6 +68,10 @@ class StorageBackend(ABC):
         """Retrieve a previously evaluated listing by ID."""
 
     @abstractmethod
+    def get_top_evaluated_listings(self, limit: int = 5) -> list[EvaluatedListing]:
+        """Return the highest-scoring evaluated listings sorted by overall_score descending."""
+
+    @abstractmethod
     def record_feedback(
         self,
         listing_id: str,
@@ -227,6 +231,15 @@ class LocalJSONStorage(StorageBackend):
         if not rec:
             return None
         return EvaluatedListing.model_validate(rec)
+
+    def get_top_evaluated_listings(self, limit: int = 5) -> list[EvaluatedListing]:
+        state = self._read_state()
+        items = [
+            EvaluatedListing.model_validate(raw)
+            for raw in state["listings"].values()
+        ]
+        items.sort(key=lambda x: x.evaluation.overall_score, reverse=True)
+        return items[:limit]
 
     def record_feedback(
         self,
@@ -391,16 +404,7 @@ class SupabaseStorage(StorageBackend):
         )
         resp.raise_for_status()
 
-    def get_evaluated_listing(self, listing_id: str) -> EvaluatedListing | None:
-        resp = self._client.get(
-            f"{self.rest_url}/listings",
-            params={"listing_id": f"eq.{listing_id}", "select": "*"},
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-        if not rows:
-            return None
-        row = rows[0]
+    def _row_to_evaluated_listing(self, row: dict[str, Any]) -> EvaluatedListing:
         listing = Listing(
             listing_id=row["listing_id"],
             source=row["source"],
@@ -427,6 +431,25 @@ class SupabaseStorage(StorageBackend):
             telegram_message_id=row.get("telegram_message_id"),
             evaluated_at=row.get("evaluated_at") or utc_now_iso(),
         )
+
+    def get_evaluated_listing(self, listing_id: str) -> EvaluatedListing | None:
+        resp = self._client.get(
+            f"{self.rest_url}/listings",
+            params={"listing_id": f"eq.{listing_id}", "select": "*"},
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        if not rows:
+            return None
+        return self._row_to_evaluated_listing(rows[0])
+
+    def get_top_evaluated_listings(self, limit: int = 5) -> list[EvaluatedListing]:
+        resp = self._client.get(
+            f"{self.rest_url}/listings",
+            params={"select": "*", "order": "overall_score.desc", "limit": str(limit)},
+        )
+        resp.raise_for_status()
+        return [self._row_to_evaluated_listing(r) for r in resp.json()]
 
     def record_feedback(
         self,

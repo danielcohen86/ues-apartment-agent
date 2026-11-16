@@ -1,0 +1,35 @@
+services:
+  # Uses Render's "web" service with "plan: free" ($0/month) instead of paid "worker"
+  - type: web
+    name: ues-family-rental-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: HEALTH_BIND_HOST
+        value: "0.0.0.0"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: "gemini-2.5-flash"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_CHAT_ID
+        sync: false
+      - key: STORAGE_BACKEND
+        value: "supabase"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: MIN_CONVICTION_SCORE
+        value: "85"
+      - key: MIN_BEDROOMS
+        value: "3"
+      - key: SCAN_INTERVAL_MINUTES
+        value: "360"

@@ -1,0 +1,155 @@
+"""Data models and Pydantic schemas for listings, Gemini evaluations, and feedback memory."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+def utc_now_iso() -> str:
+    """Return current UTC timestamp in ISO-8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+class Listing(BaseModel):
+    """Normalized rental listing scraped from StreetEasy, RentHop, NYBits, or Demo feed."""
+
+    listing_id: str = Field(..., description="Unique deterministic ID (e.g. 'se:123456')")
+    source: str = Field(..., description="Source portal name (e.g. 'StreetEasy', 'RentHop')")
+    url: str = Field(..., description="Canonical listing URL")
+    address: str = Field(..., description="Building street address")
+    unit: str = Field(default="", description="Apartment unit number (e.g. '#14A', 'PH-B')")
+    neighborhood: str = Field(
+        ...,
+        description="Neighborhood name (Upper East Side, Carnegie Hill, Yorkville, Lenox Hill)",
+    )
+    price: int = Field(..., ge=0, description="Monthly rent in USD")
+    bedrooms: float = Field(..., ge=0, description="Number of bedrooms")
+    bathrooms: float = Field(default=1.0, ge=0, description="Number of bathrooms")
+    sqft: int | None = Field(default=None, description="Approximate square footage if listed")
+    floor_info: str = Field(
+        default="",
+        description="Floor level or exposure metadata (e.g. '15th Floor, Corner South/East')",
+    )
+    description: str = Field(default="", description="Full broker listing description text")
+    amenities: list[str] = Field(default_factory=list, description="Building & unit amenities")
+    image_urls: list[str] = Field(default_factory=list, description="Listing photo URLs")
+    floorplan_urls: list[str] = Field(default_factory=list, description="Floorplan image URLs")
+    first_seen_at: str = Field(default_factory=utc_now_iso)
+
+    @property
+    def display_title(self) -> str:
+        """Formatted address + unit title."""
+        if self.unit:
+            unit_clean = self.unit if self.unit.startswith("#") else f"#{self.unit}"
+            return f"{self.address} {unit_clean}"
+        return self.address
+
+
+class EvaluationResult(BaseModel):
+    """Structured output returned by Gemini when evaluating a candidate UES rental."""
+
+    overall_score: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Overall conviction score from 0 to 100. Only exceptional matches score >= 85.",
+    )
+    light_score: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Natural light score (0-100) evaluating floor height, corner status, and S/E/W exposures.",
+    )
+    kitchen_layout_score: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Kitchen openness score (0-100) evaluating true island/breakfast bar flow into living area.",
+    )
+    has_open_island_or_breakfast_bar: bool = Field(
+        ...,
+        description="True ONLY if the kitchen is genuinely open-concept with a real island or breakfast bar/peninsula flowing into the main living space.",
+    )
+    has_high_natural_light: bool = Field(
+        ...,
+        description="True ONLY if the unit has high natural light exposure (high floor, corner unit, unobstructed south/open exposure).",
+    )
+    is_target_ues_location: bool = Field(
+        ...,
+        description="True ONLY if located in Upper East Side, Carnegie Hill, Yorkville, or Lenox Hill.",
+    )
+    disqualifiers_detected: list[str] = Field(
+        default_factory=list,
+        description="Any strict disqualifiers found (e.g., 'Closed galley kitchen', 'Pass-through without island', 'Low/dark floor', 'Dark interior hallway', or matches user NO feedback rules).",
+    )
+    light_analysis: str = Field(
+        ...,
+        description="Concise 1-2 sentence assessment of floor height, exposures, window scale, and natural light.",
+    )
+    kitchen_analysis: str = Field(
+        ...,
+        description="Concise 1-2 sentence assessment of the kitchen layout, island/breakfast bar seating, and flow into the living/dining space.",
+    )
+    feedback_alignment_notes: str = Field(
+        default="",
+        description="How this property aligns with or violates prior user YES/NO training feedback.",
+    )
+    pros: list[str] = Field(default_factory=list, description="Top 2-4 standout strengths")
+    cons: list[str] = Field(default_factory=list, description="Notable caveats or drawbacks")
+    reasoning_summary: str = Field(
+        ...,
+        description="Executive summary explaining why this property did or did not clear the 85/100 conviction bar.",
+    )
+
+    def passes_high_conviction_policy(self, threshold: int = 85) -> bool:
+        """Enforce strict deterministic gate on top of the LLM's numerical score."""
+        return (
+            self.overall_score >= threshold
+            and self.light_score >= 80
+            and self.kitchen_layout_score >= 80
+            and self.has_open_island_or_breakfast_bar is True
+            and self.has_high_natural_light is True
+            and self.is_target_ues_location is True
+            and len(self.disqualifiers_detected) == 0
+        )
+
+
+class EvaluatedListing(BaseModel):
+    """Combined listing record and evaluation stored in the database."""
+
+    listing: Listing
+    evaluation: EvaluationResult
+    alerted: bool = False
+    telegram_message_id: int | None = None
+    evaluated_at: str = Field(default_factory=utc_now_iso)
+
+
+class FeedbackEntry(BaseModel):
+    """Active training feedback item recorded from Telegram [ YES 👍 ] / [ NO 👎 ] + reason."""
+
+    id: str = Field(..., description="Feedback record ID")
+    listing_id: str = Field(..., description="Associated listing_id")
+    vote: Literal["YES", "NO"] = Field(..., description="User vote")
+    reason: str = Field(
+        default="",
+        description="User's text or voice-transcribed explanation (especially for NO votes)",
+    )
+    feedback_source: Literal["inline_button", "text_reply", "voice_note"] = "inline_button"
+    listing_snapshot: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Snapshot of listing attributes (address, neighborhood, floor, kitchen, score)",
+    )
+    created_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
+class PendingFeedbackPrompt(BaseModel):
+    """Tracks an active prompt waiting for the user's text or voice explanation after clicking NO."""
+
+    chat_id: int
+    listing_id: str
+    prompt_message_id: int | None = None
+    created_at: str = Field(default_factory=utc_now_iso)

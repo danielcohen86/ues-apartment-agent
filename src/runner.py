@@ -1,9 +1,10 @@
-"""Background daemon runner orchestrating scrapers, pre-filtering, Gemini evaluation, and Telegram alerts."""
+"""Background daemon runner orchestrating scrapers, pre-filtering, Gemini ranking, and Telegram alerts."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from dataclasses import dataclass
 
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScanCycleReport:
-    """Metrics produced by a single scrape-filter-evaluate-notify cycle."""
+    """Metrics produced by a single scrape-filter-evaluate-rank-notify cycle."""
 
     scraped_count: int = 0
     already_seen_count: int = 0
@@ -101,22 +102,33 @@ class UESRentalAgentRunner:
         return list(merged.values())
 
     async def run_scan_cycle(self, dry_run: bool = False) -> ScanCycleReport:
-        """Execute a complete scrape -> Stage-1 pre-filter -> Stage-2 Gemini -> Telegram alert pass."""
+        """
+        Execute a complete scan cycle:
+        1. Scrape candidates across all sources.
+        2. Filter against the user's live SearchCriteriaProfile (Stage 1).
+        3. Evaluate & score via Gemini with dynamic feedback memory injection (Stage 2).
+        4. Select 100% of apartments that meet all active + learned criteria, rank them #1 to #N
+           by their 100-point rubric score, and send them in ranked order.
+        """
         report = ScanCycleReport()
+        criteria = self.storage.get_criteria_profile()
         candidates = await self.collect_candidates()
         report.scraped_count = len(candidates)
         logger.info("Scan cycle started: %d total candidate listings collected", len(candidates))
+
+        qualifying_batch: list[EvaluatedListing] = []
 
         for listing in candidates:
             if self.storage.is_listing_seen(listing.listing_id):
                 report.already_seen_count += 1
                 continue
 
-            # Stage 1: Fast zero-cost deterministic pre-filter
+            # Stage 1: Fast zero-cost deterministic pre-filter using live criteria profile
             verdict = prefilter_listing(
                 listing=listing,
-                min_bedrooms=self.config.min_bedrooms,
-                max_monthly_rent=self.config.max_monthly_rent,
+                min_bedrooms=criteria.min_bedrooms,
+                max_monthly_rent=criteria.max_monthly_rent,
+                criteria=criteria,
             )
             if not verdict.passed:
                 report.prefilter_rejected_count += 1
@@ -130,12 +142,13 @@ class UESRentalAgentRunner:
                 )
                 continue
 
-            # Stage 2: Gemini multimodal evaluation with dynamic feedback memory injection
+            # Stage 2: Gemini multimodal evaluation + 100-Point Ranking Rubric
             evaluation = self.evaluator.evaluate_listing(listing)
             report.gemini_evaluated_count += 1
 
-            passes_bar = evaluation.passes_high_conviction_policy(
-                threshold=self.config.min_conviction_score
+            meets_criteria = evaluation.passes_qualifying_criteria(
+                require_open_island=criteria.require_open_island_kitchen,
+                require_high_light=criteria.require_high_natural_light,
             )
             evaluated_record = EvaluatedListing(
                 listing=listing,
@@ -144,39 +157,63 @@ class UESRentalAgentRunner:
             )
             self.storage.save_evaluated_listing(evaluated_record)
 
-            if not passes_bar:
+            if not meets_criteria:
                 report.below_threshold_count += 1
                 logger.info(
-                    "[Suppressed - Low Conviction %d/100 < %d] %s (%s): %s",
+                    "[Did Not Meet All Criteria - Score %d/100] %s (%s): %s",
                     evaluation.overall_score,
-                    self.config.min_conviction_score,
                     listing.display_title,
                     listing.neighborhood,
                     evaluation.reasoning_summary,
                 )
                 continue
 
-            # High-conviction candidate (>= 85/100 + verified open island kitchen + high light)!
+            qualifying_batch.append(evaluated_record)
+
+        # Rank 100% of qualifying apartments from #1 (highest rubric score) to #N
+        qualifying_batch.sort(
+            key=lambda item: (
+                item.evaluation.overall_score,
+                item.evaluation.kitchen_points,
+                item.evaluation.light_points,
+            ),
+            reverse=True,
+        )
+
+        total_qualifying = len(qualifying_batch)
+        for rank_idx, evaluated_record in enumerate(qualifying_batch, start=1):
             logger.info(
-                "🔥 [HIGH-CONVICTION MATCH %d/100] %s (%s) - $%d/mo",
-                evaluation.overall_score,
-                listing.display_title,
-                listing.neighborhood,
-                listing.price,
+                "🏆 [QUALIFYING MATCH — RANK #%d/%d (%d/100 pts)] %s (%s) - $%d/mo",
+                rank_idx,
+                total_qualifying,
+                evaluated_record.evaluation.overall_score,
+                evaluated_record.listing.display_title,
+                evaluated_record.listing.neighborhood,
+                evaluated_record.listing.price,
             )
             if dry_run:
                 print("\n" + "=" * 78)
-                print(format_telegram_alert_html(evaluated_record))
+                print(
+                    format_telegram_alert_html(
+                        evaluated_record,
+                        rank_index=rank_idx,
+                        total_qualified=total_qualifying,
+                    )
+                )
                 print("INLINE BUTTONS: [ YES 👍 ]   [ NO 👎 ]")
                 print("=" * 78 + "\n")
                 report.high_conviction_alerts_sent += 1
             else:
-                await self.bot.send_high_conviction_alert(evaluated_record)
+                await self.bot.send_high_conviction_alert(
+                    evaluated_record,
+                    rank_index=rank_idx,
+                    total_qualified=total_qualifying,
+                )
                 report.high_conviction_alerts_sent += 1
 
         logger.info(
             "Scan cycle finished: scraped=%d, seen=%d, prefilter_rejected=%d, "
-            "gemini_evaluated=%d, suppressed=%d, high_conviction_alerts=%d",
+            "gemini_evaluated=%d, disqualified=%d, qualifying_ranked_alerts=%d",
             report.scraped_count,
             report.already_seen_count,
             report.prefilter_rejected_count,
@@ -201,7 +238,6 @@ class UESRentalAgentRunner:
             method = parts[0].upper() if parts else ""
             path = parts[1] if len(parts) > 1 else "/"
 
-            # Drain remaining request headers safely
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                 if not line or line in (b"\r\n", b"\n"):
@@ -216,7 +252,6 @@ class UESRentalAgentRunner:
                 "Connection: close\r\n"
             )
 
-            # Enforce HTTP method allow-list (only GET allowed)
             if method != "GET":
                 body = b'{"error":"Method Not Allowed"}'
                 resp = (
@@ -259,11 +294,9 @@ class UESRentalAgentRunner:
 
     async def run_forever(self) -> None:
         """
-        Start the Telegram Bot listener (for [ YES 👍 ] / [ NO 👎 ] + text/voice reasons),
+        Start the Telegram Bot listener (for [ YES 👍 ] / [ NO 👎 ] + /actions + /criteria),
         optional Render Free Tier health-check server, and periodic scraper loop.
         """
-        import os
-
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -271,7 +304,6 @@ class UESRentalAgentRunner:
             except NotImplementedError:
                 pass
 
-        # Start health-check HTTP server if PORT is set (required by Render Free Web Service tier)
         health_server: asyncio.AbstractServer | None = None
         port_str = os.getenv("PORT", "").strip()
         if port_str.isdigit():
@@ -285,6 +317,7 @@ class UESRentalAgentRunner:
         if self.bot.app is not None:
             logger.info("Starting Telegram Bot polling for inline feedback & training loop...")
             await self.bot.app.initialize()
+            await self.bot.register_bot_commands_menu()
             await self.bot.app.start()
             if self.bot.app.updater:
                 await self.bot.app.updater.start_polling(drop_pending_updates=True)
@@ -317,4 +350,3 @@ class UESRentalAgentRunner:
                     await self.bot.app.updater.stop()
                 await self.bot.app.stop()
                 await self.bot.app.shutdown()
-

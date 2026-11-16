@@ -20,10 +20,13 @@ from src.models import (
     FeedbackEntry,
     Listing,
     PendingFeedbackPrompt,
+    SearchCriteriaProfile,
     utc_now_iso,
 )
 
 logger = logging.getLogger(__name__)
+
+SYSTEM_CRITERIA_ROW_ID = "__system_criteria_profile__"
 
 
 def build_listing_snapshot(evaluated: EvaluatedListing) -> dict[str, Any]:
@@ -47,7 +50,7 @@ def build_listing_snapshot(evaluated: EvaluatedListing) -> dict[str, Any]:
 
 
 class StorageBackend(ABC):
-    """Abstract interface for listing deduplication, score storage, and active training memory."""
+    """Abstract interface for listing deduplication, score storage, dynamic criteria, and training memory."""
 
     @abstractmethod
     def is_listing_seen(self, listing_id: str) -> bool:
@@ -72,6 +75,14 @@ class StorageBackend(ABC):
         """Return the highest-scoring evaluated listings sorted by overall_score descending."""
 
     @abstractmethod
+    def get_criteria_profile(self) -> SearchCriteriaProfile:
+        """Retrieve the user's current active search criteria profile."""
+
+    @abstractmethod
+    def save_criteria_profile(self, profile: SearchCriteriaProfile) -> SearchCriteriaProfile:
+        """Persist updated search criteria profile."""
+
+    @abstractmethod
     def record_feedback(
         self,
         listing_id: str,
@@ -84,6 +95,10 @@ class StorageBackend(ABC):
     @abstractmethod
     def get_all_feedback(self, limit: int = 100) -> list[FeedbackEntry]:
         """Return chronological feedback entries for dynamic prompt injection."""
+
+    @abstractmethod
+    def delete_feedback_entry(self, listing_id: str) -> bool:
+        """Delete a feedback entry by listing_id."""
 
     @abstractmethod
     def set_pending_feedback_prompt(
@@ -105,25 +120,49 @@ class StorageBackend(ABC):
 
     def format_feedback_for_prompt(self, max_entries: int = 50) -> str:
         """
-        Format the user's historical YES/NO feedback log for dynamic injection into Gemini prompts.
-        Ensures Gemini continuously learns from every button click, text note, and voice note.
+        Format the user's active SearchCriteriaProfile + historical YES/NO feedback log
+        for dynamic injection into Gemini prompts.
         """
+        criteria = self.get_criteria_profile()
         entries = self.get_all_feedback(limit=max_entries)
-        if not entries:
-            return (
-                "No historical user feedback recorded yet. Apply the baseline strict criteria "
-                "(85/100 conviction threshold, mandatory open island/breakfast bar kitchen flowing "
-                "into main living area, high natural light exposure)."
-            )
-
-        no_entries = [e for e in entries if e.vote == "NO"]
-        yes_entries = [e for e in entries if e.vote == "YES"]
 
         sections: list[str] = []
 
+        # 1. Active User-Adjustable Search Criteria Profile
+        sqft_str = f"Min {criteria.min_sqft:,} sq ft" if criteria.min_sqft else "Not restricted"
+        island_str = (
+            "MANDATORY (Must have open-concept kitchen with real center island or breakfast bar flowing into living room)"
+            if criteria.require_open_island_kitchen
+            else "Preferred (Boosts rank score, not a strict disqualifier)"
+        )
+        light_str = (
+            "MANDATORY (Must have high floor, corner unit, or bright open exposures; no dark lower floors)"
+            if criteria.require_high_natural_light
+            else "Preferred (Boosts rank score, not a strict disqualifier)"
+        )
+        criteria_lines = [
+            "### CURRENT ACTIVE SEARCH CRITERIA (USER-CONFIGURED):",
+            f"- Allowed Neighborhoods: {', '.join(criteria.neighborhoods)}",
+            f"- Minimum Bedrooms: {criteria.min_bedrooms:g}+ BR",
+            f"- Minimum Bathrooms: {criteria.min_bathrooms:g}+ BA",
+            f"- Maximum Monthly Rent: ${criteria.max_monthly_rent:,}/month",
+            f"- Minimum Square Footage: {sqft_str}",
+            f"- Open Island / Breakfast Bar Kitchen: {island_str}",
+            f"- High Natural Light Exposure: {light_str}",
+        ]
+        if criteria.custom_rules:
+            criteria_lines.append("- Explicit Standing Rules:")
+            for r_idx, rule in enumerate(criteria.custom_rules, start=1):
+                criteria_lines.append(f"  * Rule #{r_idx}: {rule}")
+        sections.append("\n".join(criteria_lines))
+
+        # 2. Historical User Feedback Log (NO 👎 and YES 👍)
+        no_entries = [e for e in entries if e.vote == "NO"]
+        yes_entries = [e for e in entries if e.vote == "YES"]
+
         if no_entries:
             lines = [
-                "### USER REJECTIONS (NO 👎) — STRICTLY PENALIZE OR DISQUALIFY SIMILAR PROPERTIES:"
+                "### USER REJECTIONS (NO 👎) — STRICTLY DISQUALIFY SIMILAR PROPERTIES (`passes_learned_feedback_rules = false`):"
             ]
             for idx, item in enumerate(no_entries, start=1):
                 snap = item.listing_snapshot or {}
@@ -134,7 +173,7 @@ class StorageBackend(ABC):
                 reason_str = (
                     item.reason.strip()
                     if item.reason.strip()
-                    else "User rejected this property as not meeting their high-conviction bar."
+                    else "User rejected this property as not meeting their criteria."
                 )
                 lines.append(
                     f"{idx}. REJECTED [{addr} ({neigh}, {floor_info})]: "
@@ -144,7 +183,7 @@ class StorageBackend(ABC):
 
         if yes_entries:
             lines = [
-                "### USER APPROVALS (YES 👍) — CALIBRATE HIGH SCORES TOWARD THESE ATTRIBUTES:"
+                "### USER APPROVALS (YES 👍) — BOOST `learned_preference_points` (0-15 pts) FOR SIMILAR HOMES:"
             ]
             for idx, item in enumerate(yes_entries, start=1):
                 snap = item.listing_snapshot or {}
@@ -160,14 +199,20 @@ class StorageBackend(ABC):
                 )
             sections.append("\n".join(lines))
 
+        if not no_entries and not yes_entries:
+            sections.append(
+                "### LEARNED FEEDBACK LOG:\nNo YES/NO apartment votes recorded yet."
+            )
+
         return "\n\n".join(sections)
 
 
 class LocalJSONStorage(StorageBackend):
     """Zero-cost local persistent JSON storage with atomic file writes."""
 
-    def __init__(self, file_path: Path) -> None:
+    def __init__(self, file_path: Path, default_criteria: SearchCriteriaProfile | None = None) -> None:
         self.file_path = file_path
+        self.default_criteria = default_criteria or SearchCriteriaProfile()
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.file_path.exists():
             self._write_state(
@@ -175,22 +220,34 @@ class LocalJSONStorage(StorageBackend):
                     "listings": {},
                     "feedback": {},
                     "pending_prompts": {},
+                    "criteria_profile": self.default_criteria.model_dump(),
                 }
             )
 
     def _read_state(self) -> dict[str, Any]:
         if not self.file_path.exists():
-            return {"listings": {}, "feedback": {}, "pending_prompts": {}}
+            return {
+                "listings": {},
+                "feedback": {},
+                "pending_prompts": {},
+                "criteria_profile": self.default_criteria.model_dump(),
+            }
         try:
             raw = self.file_path.read_text(encoding="utf-8")
             data = json.loads(raw) if raw.strip() else {}
             data.setdefault("listings", {})
             data.setdefault("feedback", {})
             data.setdefault("pending_prompts", {})
+            data.setdefault("criteria_profile", self.default_criteria.model_dump())
             return data
         except Exception as exc:
             logger.error("Failed reading local JSON store, initializing clean dict: %s", exc)
-            return {"listings": {}, "feedback": {}, "pending_prompts": {}}
+            return {
+                "listings": {},
+                "feedback": {},
+                "pending_prompts": {},
+                "criteria_profile": self.default_criteria.model_dump(),
+            }
 
     def _write_state(self, state: dict[str, Any]) -> None:
         fd, tmp_path = tempfile.mkstemp(
@@ -241,6 +298,20 @@ class LocalJSONStorage(StorageBackend):
         items.sort(key=lambda x: x.evaluation.overall_score, reverse=True)
         return items[:limit]
 
+    def get_criteria_profile(self) -> SearchCriteriaProfile:
+        state = self._read_state()
+        raw = state.get("criteria_profile")
+        if not raw:
+            return self.default_criteria
+        return SearchCriteriaProfile.model_validate(raw)
+
+    def save_criteria_profile(self, profile: SearchCriteriaProfile) -> SearchCriteriaProfile:
+        profile.updated_at = utc_now_iso()
+        state = self._read_state()
+        state["criteria_profile"] = profile.model_dump()
+        self._write_state(state)
+        return profile
+
     def record_feedback(
         self,
         listing_id: str,
@@ -283,10 +354,19 @@ class LocalJSONStorage(StorageBackend):
         state = self._read_state()
         items = [
             FeedbackEntry.model_validate(raw)
-            for raw in state["feedback"].values()
+            for key, raw in state["feedback"].items()
+            if key != SYSTEM_CRITERIA_ROW_ID
         ]
         items.sort(key=lambda x: x.updated_at, reverse=True)
         return items[:limit]
+
+    def delete_feedback_entry(self, listing_id: str) -> bool:
+        state = self._read_state()
+        if listing_id in state["feedback"]:
+            del state["feedback"][listing_id]
+            self._write_state(state)
+            return True
+        return False
 
     def set_pending_feedback_prompt(
         self, chat_id: int, listing_id: str, prompt_message_id: int | None = None
@@ -316,7 +396,11 @@ class LocalJSONStorage(StorageBackend):
     def get_stats(self) -> dict[str, int]:
         state = self._read_state()
         listings = state["listings"].values()
-        feedback = state["feedback"].values()
+        feedback = [
+            f
+            for k, f in state["feedback"].items()
+            if k != SYSTEM_CRITERIA_ROW_ID
+        ]
         return {
             "total_evaluated": len(listings),
             "total_alerted": sum(1 for item in listings if item.get("alerted")),
@@ -334,12 +418,18 @@ class SupabaseStorage(StorageBackend):
     Requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (see sql/schema.sql).
     """
 
-    def __init__(self, supabase_url: str, supabase_key: str) -> None:
+    def __init__(
+        self,
+        supabase_url: str,
+        supabase_key: str,
+        default_criteria: SearchCriteriaProfile | None = None,
+    ) -> None:
         if not supabase_url or not supabase_key:
             raise ValueError(
                 "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required when STORAGE_BACKEND=supabase."
             )
         self.rest_url = f"{supabase_url.rstrip('/')}/rest/v1"
+        self.default_criteria = default_criteria or SearchCriteriaProfile()
         self.headers = {
             "apikey": supabase_key,
             "Authorization": f"Bearer {supabase_key}",
@@ -451,6 +541,53 @@ class SupabaseStorage(StorageBackend):
         resp.raise_for_status()
         return [self._row_to_evaluated_listing(r) for r in resp.json()]
 
+    def get_criteria_profile(self) -> SearchCriteriaProfile:
+        try:
+            resp = self._client.get(
+                f"{self.rest_url}/feedback_memory",
+                params={"listing_id": f"eq.{SYSTEM_CRITERIA_ROW_ID}", "select": "*"},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if rows and rows[0].get("listing_snapshot"):
+                return SearchCriteriaProfile.model_validate(rows[0]["listing_snapshot"])
+        except Exception as exc:
+            logger.debug("Using default SearchCriteriaProfile (%s)", exc)
+        return self.default_criteria
+
+    def save_criteria_profile(self, profile: SearchCriteriaProfile) -> SearchCriteriaProfile:
+        profile.updated_at = utc_now_iso()
+        now = profile.updated_at
+        snapshot_data = profile.model_dump()
+
+        existing_resp = self._client.get(
+            f"{self.rest_url}/feedback_memory",
+            params={"listing_id": f"eq.{SYSTEM_CRITERIA_ROW_ID}", "select": "id"},
+        )
+        existing_resp.raise_for_status()
+        if existing_resp.json():
+            resp = self._client.patch(
+                f"{self.rest_url}/feedback_memory",
+                params={"listing_id": f"eq.{SYSTEM_CRITERIA_ROW_ID}"},
+                json={"listing_snapshot": snapshot_data, "updated_at": now},
+            )
+            resp.raise_for_status()
+        else:
+            resp = self._client.post(
+                f"{self.rest_url}/feedback_memory",
+                json={
+                    "listing_id": SYSTEM_CRITERIA_ROW_ID,
+                    "vote": "YES",
+                    "reason": "System SearchCriteriaProfile",
+                    "feedback_source": "inline_button",
+                    "listing_snapshot": snapshot_data,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            resp.raise_for_status()
+        return profile
+
     def record_feedback(
         self,
         listing_id: str,
@@ -462,7 +599,6 @@ class SupabaseStorage(StorageBackend):
         snapshot = build_listing_snapshot(evaluated) if evaluated else {"listing_id": listing_id}
         now = utc_now_iso()
 
-        # Check if feedback already exists for this listing_id
         existing_resp = self._client.get(
             f"{self.rest_url}/feedback_memory",
             params={"listing_id": f"eq.{listing_id}", "select": "*"},
@@ -523,7 +659,12 @@ class SupabaseStorage(StorageBackend):
     def get_all_feedback(self, limit: int = 100) -> list[FeedbackEntry]:
         resp = self._client.get(
             f"{self.rest_url}/feedback_memory",
-            params={"select": "*", "order": "updated_at.desc", "limit": str(limit)},
+            params={
+                "listing_id": f"neq.{SYSTEM_CRITERIA_ROW_ID}",
+                "select": "*",
+                "order": "updated_at.desc",
+                "limit": str(limit),
+            },
         )
         resp.raise_for_status()
         return [
@@ -539,6 +680,14 @@ class SupabaseStorage(StorageBackend):
             )
             for r in resp.json()
         ]
+
+    def delete_feedback_entry(self, listing_id: str) -> bool:
+        resp = self._client.delete(
+            f"{self.rest_url}/feedback_memory",
+            params={"listing_id": f"eq.{listing_id}"},
+        )
+        resp.raise_for_status()
+        return True
 
     def set_pending_feedback_prompt(
         self, chat_id: int, listing_id: str, prompt_message_id: int | None = None
@@ -587,7 +736,11 @@ class SupabaseStorage(StorageBackend):
         listings_rows = listings_resp.json()
 
         fb_resp = self._client.get(
-            f"{self.rest_url}/feedback_memory", params={"select": "vote,reason"}
+            f"{self.rest_url}/feedback_memory",
+            params={
+                "listing_id": f"neq.{SYSTEM_CRITERIA_ROW_ID}",
+                "select": "vote,reason",
+            },
         )
         fb_resp.raise_for_status()
         fb_rows = fb_resp.json()
@@ -605,16 +758,23 @@ class SupabaseStorage(StorageBackend):
 
 def create_storage_backend(config: AgentConfig) -> StorageBackend:
     """Factory that initializes Supabase PostgreSQL or falls back to Local JSON storage."""
+    default_profile = SearchCriteriaProfile(
+        neighborhoods=list(config.target_neighborhoods),
+        min_bedrooms=config.min_bedrooms,
+        min_bathrooms=2.0,
+        max_monthly_rent=config.max_monthly_rent or 25000,
+    )
     if config.storage_backend == "supabase":
         if config.supabase_url and config.supabase_service_role_key:
             logger.info("Using Supabase PostgreSQL storage backend (%s)", config.supabase_url)
             return SupabaseStorage(
                 supabase_url=config.supabase_url,
                 supabase_key=config.supabase_service_role_key,
+                default_criteria=default_profile,
             )
         logger.warning(
             "STORAGE_BACKEND=supabase requested, but SUPABASE_URL/KEY missing. "
             "Falling back to LocalJSONStorage at %s",
             config.local_storage_path,
         )
-    return LocalJSONStorage(config.local_storage_path)
+    return LocalJSONStorage(config.local_storage_path, default_criteria=default_profile)

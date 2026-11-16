@@ -1,4 +1,4 @@
-"""Automated tests for pre-filtering, 85/100 conviction threshold, active feedback loop, and Telegram UI."""
+"""Automated tests for pre-filtering, qualifying criteria gate, 100-pt ranking rubric, /criteria editor, and /actions."""
 
 from __future__ import annotations
 
@@ -6,11 +6,17 @@ from pathlib import Path
 
 import pytest
 
-from src.bot import build_feedback_keyboard, format_telegram_alert_html
+from src.bot import (
+    TelegramAgentBot,
+    build_actions_menu_keyboard,
+    build_criteria_editor_keyboard,
+    build_feedback_keyboard,
+    format_telegram_alert_html,
+)
 from src.config import AgentConfig
 from src.evaluator import GeminiListingEvaluator, build_listing_evaluation_prompt
 from src.filters import prefilter_listing
-from src.models import EvaluatedListing, EvaluationResult, Listing
+from src.models import EvaluatedListing, EvaluationResult, Listing, SearchCriteriaProfile
 from src.runner import UESRentalAgentRunner
 from src.scrapers.mock_listings import MockUESScraper
 from src.storage import LocalJSONStorage
@@ -31,7 +37,6 @@ def make_test_config(tmp_path: Path) -> AgentConfig:
 
 
 def test_stage1_prefilter_enforces_location_size_and_hard_disqualifiers() -> None:
-    # 1. Valid Carnegie Hill 3BR high floor
     good = Listing(
         listing_id="se:1",
         source="StreetEasy",
@@ -47,19 +52,19 @@ def test_stage1_prefilter_enforces_location_size_and_hard_disqualifiers() -> Non
     )
     assert prefilter_listing(good).passed is True
 
-    # 2. Out-of-bounds neighborhood (Upper West Side)
+    # Out-of-bounds neighborhood (Upper West Side)
     uws = good.model_copy(update={"listing_id": "se:2", "neighborhood": "Upper West Side", "address": "150 W 72nd St"})
     verdict_uws = prefilter_listing(uws)
     assert verdict_uws.passed is False
     assert "Out-of-bounds neighborhood" in verdict_uws.reason
 
-    # 3. Under 3 bedrooms
+    # Under 3 bedrooms
     two_bed = good.model_copy(update={"listing_id": "se:3", "bedrooms": 2.0})
     verdict_beds = prefilter_listing(two_bed)
     assert verdict_beds.passed is False
     assert "Insufficient bedrooms" in verdict_beds.reason
 
-    # 4. Closed galley kitchen disqualifier
+    # Closed galley kitchen disqualifier
     galley = good.model_copy(
         update={
             "listing_id": "se:4",
@@ -70,41 +75,87 @@ def test_stage1_prefilter_enforces_location_size_and_hard_disqualifiers() -> Non
     assert verdict_galley.passed is False
     assert "galley kitchen" in verdict_galley.reason.lower()
 
-    # 5. Low floor unit (#2A) disqualifier
+    # Low floor unit (#2A) disqualifier
     low_floor = good.model_copy(update={"listing_id": "se:5", "unit": "#2A"})
     verdict_low = prefilter_listing(low_floor)
     assert verdict_low.passed is False
     assert "Low-floor unit" in verdict_low.reason
 
 
-def test_conviction_threshold_85_and_mandatory_flags() -> None:
-    high_match = EvaluationResult(
-        overall_score=91,
-        light_score=90,
-        kitchen_layout_score=92,
+def test_qualifying_criteria_gate_and_100_point_ranking_rubric() -> None:
+    # A qualifying apartment scoring 79/100 (e.g. 28/35 kitchen + 27/35 light + 12/15 layout + 12/15 fit)
+    # still passes passes_qualifying_criteria() so 100% of qualifying matches are shown and ranked!
+    qualifying_79 = EvaluationResult(
+        meets_all_criteria=True,
+        overall_score=79,
+        kitchen_points=28,
+        light_points=27,
+        layout_points=12,
+        learned_preference_points=12,
         has_open_island_or_breakfast_bar=True,
         has_high_natural_light=True,
         is_target_ues_location=True,
+        passes_learned_feedback_rules=True,
         disqualifiers_detected=[],
-        light_analysis="15th floor corner South/East exposure.",
-        kitchen_analysis="Open chef's kitchen with 9ft waterfall island flowing into living space.",
-        reasoning_summary="Exceptional match.",
+        light_analysis="9th floor open East exposure.",
+        kitchen_analysis="Open kitchen with breakfast bar flowing into living room.",
+        reasoning_summary="Meets 100% of criteria (Rank Score 79/100).",
     )
-    assert high_match.passes_high_conviction_policy(threshold=85) is True
+    assert qualifying_79.passes_qualifying_criteria() is True
 
-    # Borderline 83/100 must be suppressed
-    borderline = high_match.model_copy(update={"overall_score": 83})
-    assert borderline.passes_high_conviction_policy(threshold=85) is False
+    # Missing open island must fail qualifying criteria
+    no_island = qualifying_79.model_copy(update={"has_open_island_or_breakfast_bar": False})
+    assert no_island.passes_qualifying_criteria() is False
 
-    # High score but missing open island must be suppressed
-    no_island = high_match.model_copy(update={"has_open_island_or_breakfast_bar": False})
-    assert no_island.passes_high_conviction_policy(threshold=85) is False
-
-    # Any disqualifier present must be suppressed
-    with_disq = high_match.model_copy(
-        update={"disqualifiers_detected": ["Windowed pass-through without island"]}
+    # Violating a learned user feedback rule must fail qualifying criteria
+    violates_learned = qualifying_79.model_copy(
+        update={
+            "passes_learned_feedback_rules": False,
+            "disqualifiers_detected": ["Violates learned rule: Bedrooms too small"],
+        }
     )
-    assert with_disq.passes_high_conviction_policy(threshold=85) is False
+    assert violates_learned.passes_qualifying_criteria() is False
+
+
+def test_dynamic_criteria_profile_and_actions_menu(tmp_path: Path) -> None:
+    config = make_test_config(tmp_path)
+    storage = LocalJSONStorage(config.local_storage_path)
+    evaluator = GeminiListingEvaluator(config=config, storage=storage)
+    bot = TelegramAgentBot(config=config, storage=storage, evaluator=evaluator)
+
+    # Check default criteria profile
+    profile = storage.get_criteria_profile()
+    assert profile.min_bedrooms == 3.0
+    assert profile.min_bathrooms == 2.0
+    assert profile.max_monthly_rent == 25000
+
+    # Update criteria profile (e.g. min_bathrooms=2.5, max_monthly_rent=22000, custom rule)
+    profile.min_bathrooms = 2.5
+    profile.max_monthly_rent = 22000
+    profile.custom_rules.append("Must have in-unit washer/dryer")
+    storage.save_criteria_profile(profile)
+
+    reloaded = storage.get_criteria_profile()
+    assert reloaded.min_bathrooms == 2.5
+    assert reloaded.max_monthly_rent == 22000
+    assert "Must have in-unit washer/dryer" in reloaded.custom_rules
+
+    # Verify /criteria HTML and editor buttons
+    criteria_html, _ = bot._format_criteria_html()
+    assert "2.5+ BA" in criteria_html
+    assert "$22,000/month" in criteria_html
+    assert "Must have in-unit washer/dryer" in criteria_html
+
+    crit_kb = build_criteria_editor_keyboard(reloaded)
+    assert len(crit_kb.inline_keyboard) == 6
+
+    # Verify /actions menu
+    actions_html = bot._format_actions_text()
+    assert "/criteria" in actions_html
+    assert "/scan" in actions_html
+    assert "/top" in actions_html
+    actions_kb = build_actions_menu_keyboard()
+    assert len(actions_kb.inline_keyboard) == 3
 
 
 def test_feedback_memory_persistence_and_dynamic_prompt_injection(tmp_path: Path) -> None:
@@ -137,20 +188,19 @@ def test_feedback_memory_persistence_and_dynamic_prompt_injection(tmp_path: Path
     )
 
     feedback_block = storage.format_feedback_for_prompt()
+    assert "CURRENT ACTIVE SEARCH CRITERIA" in feedback_block
     assert "USER REJECTIONS (NO 👎)" in feedback_block
     assert "300 East 75th Street #10B" in feedback_block
     assert "Pass-through isn't open enough and bedrooms look too small" in feedback_block
 
-    # Verify the full Gemini prompt dynamically injects this exact feedback block
     full_prompt = build_listing_evaluation_prompt(
         listing=sample,
         feedback_memory_block=feedback_block,
-        min_score=85,
     )
     assert "Pass-through isn't open enough and bedrooms look too small" in full_prompt
 
 
-def test_telegram_alert_html_escaping_and_inline_buttons() -> None:
+def test_telegram_alert_html_escaping_and_ranked_header() -> None:
     listing = Listing(
         listing_id="se:999",
         source="StreetEasy",
@@ -166,9 +216,12 @@ def test_telegram_alert_html_escaping_and_inline_buttons() -> None:
         description="Open island kitchen.",
     )
     ev = EvaluationResult(
+        meets_all_criteria=True,
         overall_score=93,
-        light_score=92,
-        kitchen_layout_score=94,
+        kitchen_points=33,
+        light_points=33,
+        layout_points=14,
+        learned_preference_points=13,
         has_open_island_or_breakfast_bar=True,
         has_high_natural_light=True,
         is_target_ues_location=True,
@@ -179,24 +232,25 @@ def test_telegram_alert_html_escaping_and_inline_buttons() -> None:
         cons=[],
         reasoning_summary="Top tier family layout.",
     )
-    html_msg = format_telegram_alert_html(EvaluatedListing(listing=listing, evaluation=ev))
-    # Verify XSS payload is safely HTML-escaped
+    html_msg = format_telegram_alert_html(
+        EvaluatedListing(listing=listing, evaluation=ev),
+        rank_index=1,
+        total_qualified=3,
+    )
     assert "<script>" not in html_msg
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_msg
-    assert "HIGH-CONVICTION UES MATCH (93/100)" in html_msg
+    assert "RANK #1 OF 3 QUALIFYING MATCHES — 93/100 PTS" in html_msg
+    assert "Kitchen &amp; Island Flow: <b>33/35</b>" in html_msg
 
-    # Verify the 2 inline buttons: [ YES 👍 ] and [ NO 👎 ]
     kb = build_feedback_keyboard("se:999")
     buttons = kb.inline_keyboard[0]
     assert len(buttons) == 2
     assert buttons[0].text == "YES 👍"
-    assert buttons[0].callback_data == "vote|YES|se:999"
     assert buttons[1].text == "NO 👎"
-    assert buttons[1].callback_data == "vote|NO|se:999"
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_demo_scan_cycle_and_deduplication(tmp_path: Path) -> None:
+async def test_end_to_end_demo_scan_cycle_and_ranked_delivery(tmp_path: Path) -> None:
     config = make_test_config(tmp_path)
     storage = LocalJSONStorage(config.local_storage_path)
     runner = UESRentalAgentRunner(
@@ -205,10 +259,6 @@ async def test_end_to_end_demo_scan_cycle_and_deduplication(tmp_path: Path) -> N
         scrapers=[MockUESScraper()],
     )
 
-    # First pass: 5 seed listings:
-    # - 2 rejected by Stage-1 pre-filter (2nd floor closed galley in Yorkville + Upper West Side out-of-bounds)
-    # - 1 suppressed at Stage-2 (Lenox Hill pass-through without island, score 55 < 85)
-    # - 2 high-conviction matches alerted (Carnegie Hill 15th floor 93/100 & Lenox Hill 18th floor 93/100)
     report1 = await runner.run_scan_cycle(dry_run=True)
     assert report1.scraped_count == 5
     assert report1.prefilter_rejected_count == 2

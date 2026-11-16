@@ -1,4 +1,4 @@
-"""Data models and Pydantic schemas for listings, Gemini evaluations, and feedback memory."""
+"""Data models and Pydantic schemas for listings, dynamic criteria, Gemini evaluations, and feedback memory."""
 
 from __future__ import annotations
 
@@ -13,11 +13,45 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class SearchCriteriaProfile(BaseModel):
+    """
+    Live, user-adjustable search criteria profile persisted in the database.
+    Can be viewed and modified anytime via Telegram (/criteria and /set).
+    """
+
+    neighborhoods: list[str] = Field(
+        default_factory=lambda: [
+            "Upper East Side",
+            "Carnegie Hill",
+            "Yorkville",
+            "Lenox Hill",
+        ],
+        description="Allowed neighborhoods",
+    )
+    min_bedrooms: float = Field(default=3.0, ge=1.0, description="Minimum number of bedrooms")
+    min_bathrooms: float = Field(default=2.0, ge=1.0, description="Minimum number of bathrooms")
+    max_monthly_rent: int = Field(default=25000, ge=1000, description="Maximum monthly rent in USD")
+    min_sqft: int | None = Field(default=None, description="Optional minimum square footage")
+    require_open_island_kitchen: bool = Field(
+        default=True,
+        description="Require open-concept kitchen with real island or breakfast bar flowing into living area",
+    )
+    require_high_natural_light: bool = Field(
+        default=True,
+        description="Require high floor, corner exposure, or bright open natural light exposure",
+    )
+    custom_rules: list[str] = Field(
+        default_factory=list,
+        description="Explicit user-added standing rules (e.g. 'Must have in-unit washer/dryer')",
+    )
+    updated_at: str = Field(default_factory=utc_now_iso)
+
+
 class Listing(BaseModel):
-    """Normalized rental listing scraped from StreetEasy, RentHop, NYBits, or Demo feed."""
+    """Normalized rental listing scraped from StreetEasy, RentHop, NYBits, Craigslist, or Search."""
 
     listing_id: str = Field(..., description="Unique deterministic ID (e.g. 'se:123456')")
-    source: str = Field(..., description="Source portal name (e.g. 'StreetEasy', 'RentHop')")
+    source: str = Field(..., description="Source portal name (e.g. 'StreetEasy', 'Craigslist-NYC')")
     url: str = Field(..., description="Canonical listing URL")
     address: str = Field(..., description="Building street address")
     unit: str = Field(default="", description="Apartment unit number (e.g. '#14A', 'PH-B')")
@@ -49,42 +83,84 @@ class Listing(BaseModel):
 
 
 class EvaluationResult(BaseModel):
-    """Structured output returned by Gemini when evaluating a candidate UES rental."""
+    """
+    Two-Part Evaluation Schema:
+    1. Binary Eligibility Gate: Does the listing meet 100% of active + learned criteria?
+    2. Explicit 100-Point Ranking Rubric: Ranks all qualifying listings from #1 to #N.
+    """
 
+    # Part 1: Strict Criteria Gate (100% of qualifying apartments are shown & ranked)
+    meets_all_criteria: bool = Field(
+        default=True,
+        description="True if and only if the apartment satisfies ALL active criteria AND all learned user feedback rules.",
+    )
+    has_open_island_or_breakfast_bar: bool = Field(
+        ...,
+        description="True ONLY if the kitchen is open-concept with a real island or breakfast bar/peninsula flowing into the main living space.",
+    )
+    has_high_natural_light: bool = Field(
+        ...,
+        description="True ONLY if the unit has high natural light exposure (high floor, corner unit, or bright open exposures).",
+    )
+    is_target_ues_location: bool = Field(
+        ...,
+        description="True ONLY if located in the user's target neighborhoods (Upper East Side, Carnegie Hill, Yorkville, Lenox Hill).",
+    )
+    passes_learned_feedback_rules: bool = Field(
+        default=True,
+        description="True ONLY if the apartment does NOT violate any of the user's learned [NO 👎] rules or custom standing criteria.",
+    )
+    disqualifiers_detected: list[str] = Field(
+        default_factory=list,
+        description="Any strict disqualifiers found (e.g., 'Closed galley kitchen', 'Pass-through without island', 'Low/dark floor', or violates a learned user NO rule).",
+    )
+
+    # Part 2: Explicit 100-Point Ranking Rubric (used to rank qualifying apartments #1 to #N)
     overall_score: int = Field(
         ...,
         ge=0,
         le=100,
-        description="Overall conviction score from 0 to 100. Only exceptional matches score >= 85.",
+        description="Total ranking score (0-100), equal to kitchen_points + light_points + layout_points + learned_preference_points.",
     )
+    kitchen_points: int = Field(
+        default=0,
+        ge=0,
+        le=35,
+        description="0-35 pts: Scale of center island/breakfast bar and openness into living/dining space.",
+    )
+    light_points: int = Field(
+        default=0,
+        ge=0,
+        le=35,
+        description="0-35 pts: Floor height, corner exposures, South/East/West sunlight, and window scale.",
+    )
+    layout_points: int = Field(
+        default=0,
+        ge=0,
+        le=15,
+        description="0-15 pts: Family bedroom sizes, bathroom count, square footage, and in-unit laundry.",
+    )
+    learned_preference_points: int = Field(
+        default=0,
+        ge=0,
+        le=15,
+        description="0-15 pts: Alignment with user's prior [YES 👍] approvals, micro-location, and value.",
+    )
+
+    # Legacy 0-100 sub-scores preserved for backwards compatibility
     light_score: int = Field(
-        ...,
+        default=0,
         ge=0,
         le=100,
-        description="Natural light score (0-100) evaluating floor height, corner status, and S/E/W exposures.",
+        description="Normalized 0-100 natural light score.",
     )
     kitchen_layout_score: int = Field(
-        ...,
+        default=0,
         ge=0,
         le=100,
-        description="Kitchen openness score (0-100) evaluating true island/breakfast bar flow into living area.",
+        description="Normalized 0-100 kitchen openness score.",
     )
-    has_open_island_or_breakfast_bar: bool = Field(
-        ...,
-        description="True ONLY if the kitchen is genuinely open-concept with a real island or breakfast bar/peninsula flowing into the main living space.",
-    )
-    has_high_natural_light: bool = Field(
-        ...,
-        description="True ONLY if the unit has high natural light exposure (high floor, corner unit, unobstructed south/open exposure).",
-    )
-    is_target_ues_location: bool = Field(
-        ...,
-        description="True ONLY if located in Upper East Side, Carnegie Hill, Yorkville, or Lenox Hill.",
-    )
-    disqualifiers_detected: list[str] = Field(
-        default_factory=list,
-        description="Any strict disqualifiers found (e.g., 'Closed galley kitchen', 'Pass-through without island', 'Low/dark floor', 'Dark interior hallway', or matches user NO feedback rules).",
-    )
+
     light_analysis: str = Field(
         ...,
         description="Concise 1-2 sentence assessment of floor height, exposures, window scale, and natural light.",
@@ -98,23 +174,37 @@ class EvaluationResult(BaseModel):
         description="How this property aligns with or violates prior user YES/NO training feedback.",
     )
     pros: list[str] = Field(default_factory=list, description="Top 2-4 standout strengths")
-    cons: list[str] = Field(default_factory=list, description="Notable caveats or drawbacks")
+    cons: list[str] = Field(default_factory=list, description="Notable caveats or trade-offs")
     reasoning_summary: str = Field(
         ...,
-        description="Executive summary explaining why this property did or did not clear the 85/100 conviction bar.",
+        description="Executive summary explaining why this property qualifies and how it ranks.",
     )
 
-    def passes_high_conviction_policy(self, threshold: int = 85) -> bool:
-        """Enforce strict deterministic gate on top of the LLM's numerical score."""
+    def passes_qualifying_criteria(
+        self,
+        require_open_island: bool = True,
+        require_high_light: bool = True,
+    ) -> bool:
+        """
+        Return True if the apartment meets 100% of the user's active criteria
+        (both current criteria settings and learned feedback rules).
+        100% of qualifying apartments are shown to the user and ranked by overall_score.
+        """
+        if require_open_island and not self.has_open_island_or_breakfast_bar:
+            return False
+        if require_high_light and not self.has_high_natural_light:
+            return False
         return (
-            self.overall_score >= threshold
-            and self.light_score >= 80
-            and self.kitchen_layout_score >= 80
-            and self.has_open_island_or_breakfast_bar is True
-            and self.has_high_natural_light is True
-            and self.is_target_ues_location is True
+            self.is_target_ues_location is True
+            and self.passes_learned_feedback_rules is True
             and len(self.disqualifiers_detected) == 0
         )
+
+    def passes_high_conviction_policy(self, threshold: int = 85) -> bool:
+        """Backwards-compatible check for threshold + qualifying criteria."""
+        if not self.passes_qualifying_criteria():
+            return False
+        return self.overall_score >= threshold
 
 
 class EvaluatedListing(BaseModel):

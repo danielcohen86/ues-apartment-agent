@@ -214,10 +214,10 @@ def format_telegram_alert_html(
     if ev.kitchen_points > 0 or ev.light_points > 0:
         rubric_line = (
             f"📊 <b>100-Pt Ranking Rubric:</b> Total <b>{ev.overall_score}/100</b>\n"
-            f"  • Kitchen &amp; Island Flow: <b>{ev.kitchen_points}/35</b>\n"
-            f"  • Natural Light &amp; Exposure: <b>{ev.light_points}/35</b>\n"
-            f"  • Family Layout &amp; Size: <b>{ev.layout_points}/15</b>\n"
-            f"  • Learned Preference Fit: <b>{ev.learned_preference_points}/15</b>"
+            f"  • Kitchen &amp; Island Flow: <b>{ev.kitchen_points}/25</b>\n"
+            f"  • Natural Light &amp; Exposure: <b>{ev.light_points}/25</b>\n"
+            f"  • Family Layout &amp; Size: <b>{ev.layout_points}/25</b>\n"
+            f"  • Learned Preference Fit: <b>{ev.learned_preference_points}/25</b>"
         )
     else:
         rubric_line = (
@@ -442,10 +442,10 @@ class TelegramAgentBot:
             f"• ☀️ <b>High Natural Light (High Floor / Corner / Open Exp):</b> {light_str}",
             "",
             "<b>100-Point Ranking Rubric (Orders Qualifying Matches #1 to #N):</b>",
-            "• Kitchen &amp; Island Flow: <b>35 pts</b>",
-            "• Natural Light &amp; Exposure: <b>35 pts</b>",
-            "• Family Layout &amp; Size: <b>15 pts</b>",
-            f"• Learned Preference Alignment ({len(yes_entries)} YES 👍 benchmarks): <b>15 pts</b>",
+            "• Kitchen &amp; Island Flow: <b>0–25 pts</b>",
+            "• Natural Light &amp; Exposure: <b>0–25 pts</b>",
+            "• Family Layout &amp; Size: <b>0–25 pts</b>",
+            f"• Learned Preference Fit (calibrated toward your prior [ YES 👍 ] votes — {len(yes_entries)} recorded): <b>0–25 pts</b>",
         ]
 
         if profile.custom_rules:

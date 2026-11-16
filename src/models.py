@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def utc_now_iso() -> str:
@@ -115,7 +115,7 @@ class EvaluationResult(BaseModel):
         description="Any strict disqualifiers found (e.g., 'Closed galley kitchen', 'Pass-through without island', 'Low/dark floor', or violates a learned user NO rule).",
     )
 
-    # Part 2: Explicit 100-Point Ranking Rubric (used to rank qualifying apartments #1 to #N)
+    # Part 2: Explicit 100-Point Ranking Rubric (25 / 25 / 25 / 25 split)
     overall_score: int = Field(
         ...,
         ge=0,
@@ -125,27 +125,44 @@ class EvaluationResult(BaseModel):
     kitchen_points: int = Field(
         default=0,
         ge=0,
-        le=35,
-        description="0-35 pts: Scale of center island/breakfast bar and openness into living/dining space.",
+        le=25,
+        description="0-25 pts: Kitchen & Island Flow — scale of center island/breakfast bar and openness into living/dining space.",
     )
     light_points: int = Field(
         default=0,
         ge=0,
-        le=35,
-        description="0-35 pts: Floor height, corner exposures, South/East/West sunlight, and window scale.",
+        le=25,
+        description="0-25 pts: Natural Light & Exposure — floor height, corner exposures, South/East/West sunlight, and window scale.",
     )
     layout_points: int = Field(
         default=0,
         ge=0,
-        le=15,
-        description="0-15 pts: Family bedroom sizes, bathroom count, square footage, and in-unit laundry.",
+        le=25,
+        description="0-25 pts: Family Layout & Size — bedroom proportions, bathroom count, square footage, closets, and in-unit laundry.",
     )
     learned_preference_points: int = Field(
         default=0,
         ge=0,
-        le=15,
-        description="0-15 pts: Alignment with user's prior [YES 👍] approvals, micro-location, and value.",
+        le=25,
+        description="0-25 pts: Learned Preference Fit — calibrated toward user's prior [YES 👍] votes, micro-location, and value.",
     )
+
+    @field_validator(
+        "kitchen_points",
+        "light_points",
+        "layout_points",
+        "learned_preference_points",
+        mode="before",
+    )
+    @classmethod
+    def _clamp_rubric_points(cls, v: Any) -> int:
+        """Clamp rubric sub-scores to [0, 25] for backwards compatibility with legacy stored rows."""
+        if v is None:
+            return 0
+        try:
+            return max(0, min(25, int(round(float(v)))))
+        except (TypeError, ValueError):
+            return 0
 
     # Legacy 0-100 sub-scores preserved for backwards compatibility
     light_score: int = Field(

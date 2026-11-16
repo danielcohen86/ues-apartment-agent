@@ -83,15 +83,15 @@ def test_stage1_prefilter_enforces_location_size_and_hard_disqualifiers() -> Non
 
 
 def test_qualifying_criteria_gate_and_100_point_ranking_rubric() -> None:
-    # A qualifying apartment scoring 79/100 (e.g. 28/35 kitchen + 27/35 light + 12/15 layout + 12/15 fit)
+    # A qualifying apartment scoring 79/100 (e.g. 20/25 kitchen + 20/25 light + 20/25 layout + 19/25 fit)
     # still passes passes_qualifying_criteria() so 100% of qualifying matches are shown and ranked!
     qualifying_79 = EvaluationResult(
         meets_all_criteria=True,
         overall_score=79,
-        kitchen_points=28,
-        light_points=27,
-        layout_points=12,
-        learned_preference_points=12,
+        kitchen_points=20,
+        light_points=20,
+        layout_points=20,
+        learned_preference_points=19,
         has_open_island_or_breakfast_bar=True,
         has_high_natural_light=True,
         is_target_ues_location=True,
@@ -102,6 +102,14 @@ def test_qualifying_criteria_gate_and_100_point_ranking_rubric() -> None:
         reasoning_summary="Meets 100% of criteria (Rank Score 79/100).",
     )
     assert qualifying_79.passes_qualifying_criteria() is True
+
+    # Legacy stored >25 rubric values are safely clamped to 25 for backwards compatibility
+    legacy_row = qualifying_79.model_dump()
+    legacy_row["kitchen_points"] = 33
+    legacy_row["light_points"] = 33
+    parsed_legacy = EvaluationResult.model_validate(legacy_row)
+    assert parsed_legacy.kitchen_points == 25
+    assert parsed_legacy.light_points == 25
 
     # Missing open island must fail qualifying criteria
     no_island = qualifying_79.model_copy(update={"has_open_island_or_breakfast_bar": False})
@@ -145,6 +153,8 @@ def test_dynamic_criteria_profile_and_actions_menu(tmp_path: Path) -> None:
     assert "2.5+ BA" in criteria_html
     assert "$22,000/month" in criteria_html
     assert "Must have in-unit washer/dryer" in criteria_html
+    assert "0–25 pts" in criteria_html
+    assert "Learned Preference Fit" in criteria_html
 
     crit_kb = build_criteria_editor_keyboard(reloaded)
     assert len(crit_kb.inline_keyboard) == 6
@@ -218,10 +228,10 @@ def test_telegram_alert_html_escaping_and_ranked_header() -> None:
     ev = EvaluationResult(
         meets_all_criteria=True,
         overall_score=93,
-        kitchen_points=33,
-        light_points=33,
-        layout_points=14,
-        learned_preference_points=13,
+        kitchen_points=24,
+        light_points=24,
+        layout_points=23,
+        learned_preference_points=22,
         has_open_island_or_breakfast_bar=True,
         has_high_natural_light=True,
         is_target_ues_location=True,
@@ -240,7 +250,10 @@ def test_telegram_alert_html_escaping_and_ranked_header() -> None:
     assert "<script>" not in html_msg
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_msg
     assert "RANK #1 OF 3 QUALIFYING MATCHES — 93/100 PTS" in html_msg
-    assert "Kitchen &amp; Island Flow: <b>33/35</b>" in html_msg
+    assert "Kitchen &amp; Island Flow: <b>24/25</b>" in html_msg
+    assert "Natural Light &amp; Exposure: <b>24/25</b>" in html_msg
+    assert "Family Layout &amp; Size: <b>23/25</b>" in html_msg
+    assert "Learned Preference Fit: <b>22/25</b>" in html_msg
 
     kb = build_feedback_keyboard("se:999")
     buttons = kb.inline_keyboard[0]

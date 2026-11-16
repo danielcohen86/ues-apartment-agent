@@ -49,21 +49,23 @@ STAGE 2: EXPLICIT 100-POINT RANKING RUBRIC (Rank Qualifying Apartments #1 to #N)
 ================================================================================
 Score each apartment using this transparent 100-point additive rubric so all qualifying apartments can be ranked from best (#1) to lowest:
 
-1. `kitchen_points` (0 to 35 pts):
-   - 30–35 pts: Showpiece chef's open kitchen with large center/waterfall island, counter seating, and seamless great-room flow.
-   - 22–29 pts: Verified open kitchen with breakfast bar / peninsula or standard island opening into living/dining area.
-   - 0–21 pts: Closed, galley, or non-open pass-through (fails Stage 1).
+1. `kitchen_points` (0 to 25 pts — Kitchen & Island Flow):
+   - 22–25 pts: Showpiece chef's open kitchen with large center/waterfall island, counter seating, and seamless great-room flow.
+   - 16–21 pts: Verified open kitchen with breakfast bar / peninsula or standard island opening into living/dining area.
+   - 0–15 pts: Closed, galley, or non-open pass-through (fails Stage 1).
 
-2. `light_points` (0 to 35 pts):
-   - 30–35 pts: High floor (10th+ floor or PH) AND corner exposure or open South/East/West views with oversized windows.
-   - 22–29 pts: Solid high/mid-high floor (6th–9th floor) or bright open exposure with good natural light.
-   - 0–21 pts: Low floor or dark exposure (fails Stage 1).
+2. `light_points` (0 to 25 pts — Natural Light & Exposure):
+   - 22–25 pts: High floor (10th+ floor or PH) AND corner exposure or open South/East/West views with oversized windows.
+   - 16–21 pts: Solid high/mid-high floor (6th–9th floor) or bright open exposure with good natural light.
+   - 0–15 pts: Low floor or dark exposure (fails Stage 1).
 
-3. `layout_points` (0 to 15 pts):
-   - Evaluates generous bedroom dimensions (fits king + kids' rooms), 2.5+ bathrooms, square footage, closet space, and in-unit washer/dryer.
+3. `layout_points` (0 to 25 pts — Family Layout & Size):
+   - 22–25 pts: Generous family bedroom dimensions (king primary + spacious kids' bedrooms), 2.5–3+ bathrooms, strong square footage, great closets, and in-unit washer/dryer.
+   - 16–21 pts: Solid 3+ BR / 2+ BA family layout meeting active size criteria.
+   - 0–15 pts: Cramped/awkward layout or undersized bedrooms.
 
-4. `learned_preference_points` (0 to 15 pts):
-   - Evaluates how closely this apartment matches the user's prior `[YES 👍]` approvals, preferred micro-neighborhood/blocks, and price-to-quality value.
+4. `learned_preference_points` (0 to 25 pts — Learned Preference Fit):
+   - Calibrated toward the user's prior `[YES 👍]` votes, preferred micro-neighborhood/blocks, building quality, and price-to-quality value (if no `[YES 👍]` votes exist yet, score 16–22 pts based on Carnegie Hill / UES family appeal and rent value).
 
 Set `overall_score = kitchen_points + light_points + layout_points + learned_preference_points`.
 
@@ -112,7 +114,7 @@ FULL DESCRIPTION:
 \"\"\"
 
 1. Check Stage 1 (Eligibility Gate: Location, 3+ BR, Open Kitchen w/ Island or Breakfast Bar, High Natural Light, and Learned Feedback Rules).
-2. Compute Stage 2 (100-Point Ranking Rubric: kitchen_points [0-35] + light_points [0-35] + layout_points [0-15] + learned_preference_points [0-15]).
+2. Compute Stage 2 (100-Point Ranking Rubric: kitchen_points [0-25] + light_points [0-25] + layout_points [0-25] + learned_preference_points [0-25]).
 Return your assessment matching the required JSON schema.
 """
     return f"{system_block}\n{user_block}"
@@ -254,9 +256,9 @@ class GeminiListingEvaluator:
             )
             result.overall_score = max(0, min(100, computed_total))
             if result.kitchen_layout_score == 0:
-                result.kitchen_layout_score = round((result.kitchen_points / 35.0) * 100)
+                result.kitchen_layout_score = round((result.kitchen_points / 25.0) * 100)
             if result.light_score == 0:
-                result.light_score = round((result.light_points / 35.0) * 100)
+                result.light_score = round((result.light_points / 25.0) * 100)
 
         qualifies = (
             result.has_open_island_or_breakfast_bar
@@ -275,14 +277,14 @@ class GeminiListingEvaluator:
     ) -> EvaluationResult:
         """
         Deterministic rubric evaluator used when GEMINI_API_KEY is unset.
-        Applies Stage-1 Eligibility Gate + Stage-2 100-Point Ranking Rubric.
+        Applies Stage-1 Eligibility Gate + Stage-2 100-Point Ranking Rubric (25/25/25/25).
         """
         text = f"{listing.display_title} {listing.floor_info} {listing.description} {' '.join(listing.amenities)}".lower()
         disqualifiers: list[str] = []
         pros: list[str] = []
         cons: list[str] = []
 
-        # 1. Kitchen evaluation (0 - 35 pts)
+        # 1. Kitchen & Island Flow evaluation (0 - 25 pts)
         has_open_kitchen = any(
             kw in text
             for kw in (
@@ -306,21 +308,21 @@ class GeminiListingEvaluator:
 
         if has_galley_or_closed:
             disqualifiers.append("Closed or galley kitchen layout")
-            kitchen_pts = 10
-            kitchen_score = 30
+            kitchen_pts = 7
+            kitchen_score = 28
             has_open_island = False
             kitchen_analysis = "Disqualified: Listing describes a closed or galley kitchen layout."
         elif has_pass_through_only:
             disqualifiers.append("Windowed/cut-out pass-through without a true open island")
-            kitchen_pts = 18
+            kitchen_pts = 13
             kitchen_score = 52
             has_open_island = False
             kitchen_analysis = (
                 "Disqualified: Features a pass-through cut-out rather than a true open island flowing into the living room."
             )
         elif has_open_kitchen and has_island_or_bar:
-            kitchen_pts = 33 if "waterfall" in text or "chef" in text else 30
-            kitchen_score = round((kitchen_pts / 35.0) * 100)
+            kitchen_pts = 24 if "waterfall" in text or "chef" in text else 21
+            kitchen_score = round((kitchen_pts / 25.0) * 100)
             has_open_island = True
             kitchen_analysis = (
                 "Open-concept kitchen with a real island/breakfast bar flowing directly into the main living and dining area."
@@ -328,12 +330,12 @@ class GeminiListingEvaluator:
             pros.append("Open-concept kitchen with center island / breakfast bar flow")
         else:
             disqualifiers.append("Unverified open island or breakfast bar kitchen layout")
-            kitchen_pts = 20
-            kitchen_score = 58
+            kitchen_pts = 14
+            kitchen_score = 56
             has_open_island = False
             kitchen_analysis = "Does not clearly confirm an open kitchen with a real island or breakfast bar."
 
-        # 2. Natural Light & Floor Height evaluation (0 - 35 pts)
+        # 2. Natural Light & Exposure evaluation (0 - 25 pts)
         high_light_signals = [
             "high floor",
             "corner unit",
@@ -357,13 +359,13 @@ class GeminiListingEvaluator:
 
         if floor_num is not None and floor_num <= 4:
             disqualifiers.append(f"Low floor ({floor_num}th floor) with limited natural light")
-            light_pts = 12
-            light_score = 35
+            light_pts = 8
+            light_score = 32
             has_high_light = False
             light_analysis = f"Disqualified: Located on a lower floor ({floor_num}th floor)."
         elif len(matched_light) >= 2 or (floor_num is not None and floor_num >= 6):
-            light_pts = 33 if (floor_num and floor_num >= 12) else 29
-            light_score = round((light_pts / 35.0) * 100)
+            light_pts = 24 if (floor_num and floor_num >= 12) else 21
+            light_score = round((light_pts / 25.0) * 100)
             has_high_light = True
             light_analysis = (
                 f"Strong natural light indicators ({', '.join(matched_light[:3]) or 'high floor'}) "
@@ -372,24 +374,26 @@ class GeminiListingEvaluator:
             pros.append(f"High natural light ({listing.floor_info or 'elevated open exposures'})")
         else:
             disqualifiers.append("Insufficient proof of high natural light / high floor")
-            light_pts = 20
-            light_score = 58
+            light_pts = 14
+            light_score = 56
             has_high_light = False
             light_analysis = "Modest or unverified natural light exposure."
 
-        # 3. Family Layout Points (0 - 15 pts)
-        layout_pts = 11
+        # 3. Family Layout & Size Points (0 - 25 pts)
+        layout_pts = 18
         if listing.bedrooms >= 4:
-            layout_pts += 2
+            layout_pts += 3
         if listing.bathrooms >= 3:
-            layout_pts += 1
+            layout_pts += 2
         if listing.sqft and listing.sqft >= 2000:
+            layout_pts += 2
+        if "washer" in text or "w/d" in text or "laundry in unit" in text:
             layout_pts += 1
-        layout_pts = min(15, layout_pts)
+        layout_pts = min(25, layout_pts)
 
-        # 4. Learned Feedback Alignment (0 - 15 pts) & Disqualifier Check
+        # 4. Learned Preference Fit (0 - 25 pts) & Disqualifier Check
         passes_learned = True
-        learned_pts = 13
+        learned_pts = 21
         feedback_alignment = "Matches all active training feedback criteria."
         for entry in self.storage.get_all_feedback(limit=50):
             if entry.vote == "NO" and entry.reason.strip():
@@ -398,12 +402,12 @@ class GeminiListingEvaluator:
                     "compact bedrooms" in text or (listing.sqft is not None and listing.sqft < 1400)
                 ):
                     passes_learned = False
-                    learned_pts = 3
+                    learned_pts = 5
                     disqualifiers.append(f"Violates learned rule: '{entry.reason}'")
                     feedback_alignment = f"Disqualified by learned user rule: '{entry.reason}'"
                 elif "pass-through" in reason_lower and "pass-through" in text:
                     passes_learned = False
-                    learned_pts = 3
+                    learned_pts = 5
                     disqualifiers.append(f"Violates learned rule: '{entry.reason}'")
                     feedback_alignment = f"Disqualified by learned user rule: '{entry.reason}'"
 
@@ -426,7 +430,7 @@ class GeminiListingEvaluator:
             pros.append(f"{int(listing.bedrooms)}BR family layout in {listing.neighborhood}")
             summary = (
                 f"Meets 100% of criteria (Rank Score {total_score}/100 — "
-                f"Kitchen {kitchen_pts}/35, Light {light_pts}/35, Layout {layout_pts}/15, Fit {learned_pts}/15)."
+                f"Kitchen {kitchen_pts}/25, Light {light_pts}/25, Layout {layout_pts}/25, Fit {learned_pts}/25)."
             )
 
         return EvaluationResult(

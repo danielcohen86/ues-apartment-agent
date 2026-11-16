@@ -183,7 +183,7 @@ class StorageBackend(ABC):
 
         if yes_entries:
             lines = [
-                "### USER APPROVALS (YES 👍) — BOOST `learned_preference_points` (0-15 pts) FOR SIMILAR HOMES:"
+                "### USER APPROVALS (YES 👍) — BOOST `learned_preference_points` (0-25 pts) FOR SIMILAR HOMES:"
             ]
             for idx, item in enumerate(yes_entries, start=1):
                 snap = item.listing_snapshot or {}

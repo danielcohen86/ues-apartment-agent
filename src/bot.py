@@ -778,7 +778,7 @@ class TelegramAgentBot:
         criteria = self.storage.get_criteria_profile()
         hoods = ", ".join(criteria.neighborhoods)
         is_calibrated = bool(
-            criteria.calibration_completed and criteria.streeteasy_calibration_v2_completed
+            criteria.calibration_completed and criteria.streeteasy_calibration_v3_completed
         )
         cal_str = (
             "✅ Calibrated on StreetEasy — Sending Brand-New StreetEasy Listings Only"
@@ -915,17 +915,36 @@ class TelegramAgentBot:
         await self._send_top_evaluated(update.effective_chat.id)
 
     async def cmd_test_alert(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Send a sample Carnegie Hill 3BR alert so the user can test feedback buttons."""
+        """Send a sample alert card without polluting production storage with synthetic URLs."""
         if not self._is_authorized(update) or not update.effective_chat:
             return
+        real_top = self.storage.get_top_evaluated_listings(limit=1)
+        if real_top:
+            await self.send_high_conviction_alert(
+                real_top[0],
+                target_chat_id=update.effective_chat.id,
+                rank_index=1,
+                total_qualified=1,
+            )
+            return
+
         mock_scraper = MockUESScraper()
-        sample_listing = (await mock_scraper.fetch_listings())[0]
+        sample_listing = (await mock_scraper.fetch_listings())[0].model_copy(
+            update={
+                "listing_id": "demo:preview-sample",
+                "source": "StreetEasy-Preview",
+                "url": "https://streeteasy.com/for-rent/ues/beds%3E=3",
+            }
+        )
         evaluation = self.evaluator.evaluate_listing(sample_listing)
         evaluated = EvaluatedListing(listing=sample_listing, evaluation=evaluation, alerted=True)
-        self.storage.save_evaluated_listing(evaluated)
-        await self.send_high_conviction_alert(
-            evaluated, target_chat_id=update.effective_chat.id, rank_index=1, total_qualified=1
-        )
+        if self.app:
+            await self.app.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=format_telegram_alert_html(evaluated, rank_index=1, total_qualified=1),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_feedback_keyboard(sample_listing.listing_id),
+            )
 
     async def handle_vote_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

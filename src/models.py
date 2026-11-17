@@ -50,7 +50,11 @@ class SearchCriteriaProfile(BaseModel):
     )
     streeteasy_calibration_v2_completed: bool = Field(
         default=False,
-        description="True once the StreetEasy-exclusive v2 calibration batch has purged legacy sources and sent Top-10 StreetEasy listings.",
+        description="Legacy v2 flag.",
+    )
+    streeteasy_calibration_v3_completed: bool = Field(
+        default=False,
+        description="True once the live-link-verified StreetEasy v3 Top-10 calibration batch has completed.",
     )
     calibration_batch_size: int = Field(
         default=10,

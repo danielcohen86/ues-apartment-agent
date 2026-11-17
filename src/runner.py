@@ -1,4 +1,4 @@
-"""Background daemon runner orchestrating StreetEasy-exclusive scraping, pre-filtering, Gemini Vision ranking, and Telegram alerts."""
+"""Background daemon runner orchestrating StreetEasy-exclusive scraping, live link verification, Gemini Vision ranking, and Telegram alerts."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import logging
 import os
 import signal
 from dataclasses import dataclass
+
+import httpx
 
 from src.bot import TelegramAgentBot, format_telegram_alert_html
 from src.config import AgentConfig
@@ -23,12 +25,12 @@ from src.storage import StorageBackend, create_storage_backend
 
 logger = logging.getLogger(__name__)
 
-MAX_CALIBRATION_GEMINI_EVALS = 24
+MAX_CALIBRATION_GEMINI_EVALS = 20
 
 
 def _calibration_candidate_priority(listing: Listing) -> tuple[int, ...]:
     """
-    Pre-rank Stage-1 qualifying StreetEasy listings before full Gemini Vision inspection
+    Pre-rank Stage-1 qualifying StreetEasy listings before detail enrichment & Gemini Vision
     so calibration evaluates the highest-potential UES family homes first while still
     marking 100% of active StreetEasy inventory as seen.
     """
@@ -36,9 +38,15 @@ def _calibration_candidate_priority(listing: Listing) -> tuple[int, ...]:
     eff_floor = floor_num if floor_num is not None else 8
     am_text = f"{' '.join(listing.amenities)} {listing.description}".lower()
     has_wd = 1 if ("washer" in am_text or "w/d" in am_text) else 0
-    is_luxury = 1 if ("condo" in am_text or "new development" in am_text or "doorman" in am_text) else 0
+    is_luxury = (
+        1
+        if ("condo" in am_text or "new development" in am_text or "doorman" in am_text)
+        else 0
+    )
     has_media = len(listing.floorplan_urls) * 2 + min(4, len(listing.image_urls))
-    prime_hood = 1 if listing.neighborhood in ("Carnegie Hill", "Lenox Hill", "Yorkville") else 0
+    prime_hood = (
+        1 if listing.neighborhood in ("Carnegie Hill", "Lenox Hill", "Yorkville") else 0
+    )
     return (
         1 if eff_floor >= 10 else (0 if eff_floor >= 6 else -1),
         has_wd,
@@ -64,7 +72,7 @@ class ScanCycleReport:
 
 
 class UESRentalAgentRunner:
-    """Continuous background service coordinating StreetEasy scraper, Gemini Vision evaluator, storage, and Telegram bot."""
+    """Continuous background service coordinating StreetEasy scraper, link verifier, Gemini Vision evaluator, storage, and Telegram bot."""
 
     def __init__(
         self,
@@ -93,6 +101,12 @@ class UESRentalAgentRunner:
         )
         self._scan_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+
+    def _get_live_streeteasy_scraper(self) -> StreetEasyUESScraper | None:
+        for scraper in self.scrapers:
+            if isinstance(scraper, StreetEasyUESScraper):
+                return scraper
+        return None
 
     async def _manual_scan_From_telegram(self) -> dict[str, int]:
         report = await self.run_scan_cycle()
@@ -138,41 +152,87 @@ class UESRentalAgentRunner:
 
         return list(merged.values())
 
+    async def _enrich_and_verify_batch(self, listings: list[Listing]) -> list[Listing]:
+        """
+        Verify each candidate URL is a live, active StreetEasy page (filtering out 404/off-market links)
+        and enrich with full broker description, amenities, 1500px floorplan, and gallery photos.
+        """
+        se_scraper = self._get_live_streeteasy_scraper()
+        if se_scraper is None or not listings:
+            return listings
+
+        sem = asyncio.Semaphore(4)
+        verified: list[Listing | None] = [None] * len(listings)
+
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            async def _worker(idx: int, item: Listing) -> None:
+                async with sem:
+                    ok = await se_scraper.enrich_and_verify_listing(item, client=client)
+                    if ok:
+                        verified[idx] = item
+
+            await asyncio.gather(*(_worker(i, l) for i, l in enumerate(listings)))
+
+        return [item for item in verified if item is not None]
+
     async def run_calibration_batch(
         self, limit: int | None = None, dry_run: bool = False
     ) -> dict[str, int]:
         """
-        StreetEasy-Exclusive Calibration Workflow (Startup v2 or on-demand /calibrate):
-        1. Purges any legacy non-StreetEasy (e.g. Craigslist) rows from storage.
-        2. Scrapes all currently active StreetEasy UES 3+ BR inventory.
-        3. Evaluates top active StreetEasy candidates via Gemini 3.6 Vision (high-res 960px photos + floorplans)
-           and baselines 100% of all currently active StreetEasy apartments as SEEN so zero existing
-           apartments ever trickle in later.
-        4. Sends ONLY the Top `limit` (default 10) highest-scoring active StreetEasy listings to Telegram
-           for [ YES 👍 ] / [ NO 👎 ] calibration rating, then switches to New-StreetEasy-Listings-Only mode.
+        StreetEasy-Exclusive Live-Verified Calibration Workflow (Startup v3 or on-demand /calibrate):
+        1. Scrapes all currently active StreetEasy UES 3+ BR inventory via dual cloud providers.
+        2. Aborts safely (without marking calibration complete) if < 5 live listings were fetched.
+        3. Wipes stale/mock/legacy listing records while preserving 100% of user feedback memory.
+        4. Verifies live detail links + enriches floorplans/photos/descriptions on top candidates,
+           evaluates via Gemini 3.6 Vision, and baselines 100% of active StreetEasy inventory as SEEN.
+        5. Sends ONLY the Top `limit` (default 10) highest-scoring active StreetEasy listings to Telegram
+           for [ YES 👍 ] / [ NO 👎 ] calibration rating, then switches to New-Listings-Only mode.
         """
         async with self._scan_lock:
-            purged_count = self.storage.purge_non_streeteasy_listings()
-            if purged_count > 0:
-                logger.info("Purged %d legacy non-StreetEasy rows prior to StreetEasy calibration.", purged_count)
-
             criteria = self.storage.get_criteria_profile()
             batch_limit = limit or criteria.calibration_batch_size
 
             if not dry_run:
                 await self.bot.send_info_message(
-                    f"🎯 <b>Starting StreetEasy-Only Top-{batch_limit} Calibration</b>\n"
-                    "Scanning all currently active <b>StreetEasy</b> UES 3+ BR listings, inspecting high-res "
-                    "gallery photos &amp; floorplans with Gemini Vision, baselining all existing StreetEasy inventory "
-                    f"as seen, and selecting the <b>{batch_limit} highest-scoring active apartments</b> for you to rate..."
+                    f"🎯 <b>Starting StreetEasy Top-{batch_limit} Calibration</b>\n"
+                    "Fetching all currently active <b>StreetEasy</b> UES 3+ BR listings, verifying live links "
+                    "&amp; floorplans, scoring with Gemini 3.6 Vision, and selecting the "
+                    f"<b>{batch_limit} best active apartments</b> for you to rate..."
                 )
 
             candidates = await self.collect_candidates()
-            seen_ids, seen_addr_keys = self.storage.get_seen_identifiers()
+            if not dry_run and len(candidates) < 5:
+                logger.warning(
+                    "Calibration aborted: StreetEasy scrape returned only %d listings; will retry.",
+                    len(candidates),
+                )
+                await self.bot.send_info_message(
+                    f"⚠️ <b>StreetEasy Temporarily Rate-Limited ({len(candidates)} listings returned)</b>\n"
+                    "Calibration was <b>not</b> marked complete so no partial/stale batch is sent. "
+                    "Tap <b>/calibrate</b> in a minute or wait for the automatic retry."
+                )
+                return {
+                    "scraped_count": len(candidates),
+                    "newly_evaluated": 0,
+                    "baselined_total": 0,
+                    "calibration_sent": 0,
+                }
+
+            # Freshly scraped >= 5 live StreetEasy listings (or unit-test dry_run):
+            # Wipe any stale/mock/broken listing rows while keeping feedback_memory 100% intact.
+            purged = self.storage.purge_all_listings_for_recalibration()
+            if purged > 0:
+                logger.info(
+                    "Cleared %d previous listing rows for clean StreetEasy recalibration.",
+                    purged,
+                )
+
+            seen_ids: set[str] = set()
+            seen_addr_keys: set[str] = set()
             newly_evaluated = 0
             baselined_count = 0
 
-            unseen_stage1_passed: list[Listing] = []
+            stage1_passed: list[Listing] = []
             for listing in candidates:
                 addr_key = canonicalize_nyc_address_key(listing.address, listing.unit, listing.url)
                 if listing.listing_id in seen_ids or (addr_key and addr_key in seen_addr_keys):
@@ -193,52 +253,51 @@ class UESRentalAgentRunner:
                     baselined_count += 1
                     continue
 
-                unseen_stage1_passed.append(listing)
+                stage1_passed.append(listing)
 
-            # Prioritize strongest StreetEasy candidates for full Gemini Vision inspection
+            # Prioritize strongest StreetEasy candidates for live detail enrichment + Gemini Vision
             # while marking 100% of remaining active StreetEasy listings as baseline-seen.
-            unseen_stage1_passed.sort(key=_calibration_candidate_priority, reverse=True)
+            stage1_passed.sort(key=_calibration_candidate_priority, reverse=True)
             eval_cap = max(batch_limit * 2, MAX_CALIBRATION_GEMINI_EVALS)
-            to_evaluate = unseen_stage1_passed[:eval_cap]
-            to_baseline_overflow = unseen_stage1_passed[eval_cap:]
+            top_candidates = stage1_passed[:eval_cap]
+            overflow_candidates = stage1_passed[eval_cap:]
 
-            for overflow_listing in to_baseline_overflow:
+            for overflow_listing in overflow_candidates:
                 self.storage.save_baseline_seen_listing(
                     overflow_listing,
                     "Baselined active StreetEasy inventory during initial calibration",
                 )
                 baselined_count += 1
 
-            for listing in to_evaluate:
-                if newly_evaluated > 0 and self.config.gemini_api_key:
-                    await asyncio.sleep(2.0)
+            # Verify live StreetEasy detail URLs & enrich with full floorplans, photos, and broker descriptions
+            verified_candidates = await self._enrich_and_verify_batch(top_candidates)
 
-                evaluation = await asyncio.to_thread(self.evaluator.evaluate_listing, listing)
+            eval_sem = asyncio.Semaphore(2)
+            eval_results: list[tuple[Listing, object] | None] = [None] * len(verified_candidates)
+
+            async def _eval_worker(idx: int, item: Listing) -> None:
+                async with eval_sem:
+                    if idx > 0 and self.config.gemini_api_key:
+                        await asyncio.sleep(0.8)
+                    ev_res = await asyncio.to_thread(self.evaluator.evaluate_listing, item)
+                    eval_results[idx] = (item, ev_res)
+
+            if verified_candidates:
+                await asyncio.gather(
+                    *(_eval_worker(i, cand) for i, cand in enumerate(verified_candidates))
+                )
+
+            for pair in eval_results:
+                if pair is None:
+                    continue
+                listing, evaluation = pair
                 newly_evaluated += 1
                 self.storage.save_evaluated_listing(
                     EvaluatedListing(listing=listing, evaluation=evaluation, alerted=False)
                 )
 
-            # Build Top-N calibration batch strictly from StreetEasy evaluated inventory
             all_evaluated = self.storage.get_top_evaluated_listings(limit=80)
-            voted_ids = {f.listing_id for f in self.storage.get_all_feedback(limit=200)}
-
-            unalerted_pool = [
-                item
-                for item in all_evaluated
-                if not item.alerted and item.listing.listing_id not in voted_ids
-            ]
-            if len(unalerted_pool) < batch_limit:
-                extra_unvoted = [
-                    item
-                    for item in all_evaluated
-                    if item.alerted and item.listing.listing_id not in voted_ids
-                ]
-                pool = unalerted_pool + extra_unvoted
-            else:
-                pool = unalerted_pool
-
-            pool.sort(
+            all_evaluated.sort(
                 key=lambda item: (
                     item.evaluation.passes_qualifying_criteria(
                         require_open_island=criteria.require_open_island_kitchen,
@@ -250,7 +309,7 @@ class UESRentalAgentRunner:
                 ),
                 reverse=True,
             )
-            calibration_batch = pool[:batch_limit]
+            calibration_batch = all_evaluated[:batch_limit]
             total_to_send = len(calibration_batch)
 
             sent_count = 0
@@ -267,29 +326,29 @@ class UESRentalAgentRunner:
                     )
                     sent_count += 1
 
-            # Persist StreetEasy v2 calibration flags so future restarts & scans only send NEW StreetEasy options
-            latest_criteria = self.storage.get_criteria_profile()
-            latest_criteria.calibration_completed = True
-            latest_criteria.streeteasy_calibration_v2_completed = True
-            self.storage.save_criteria_profile(latest_criteria)
+            if sent_count > 0:
+                latest_criteria = self.storage.get_criteria_profile()
+                latest_criteria.calibration_completed = True
+                latest_criteria.streeteasy_calibration_v2_completed = True
+                latest_criteria.streeteasy_calibration_v3_completed = True
+                self.storage.save_criteria_profile(latest_criteria)
 
             total_seen_now = len(seen_ids)
             if not dry_run:
                 if sent_count > 0:
                     await self.bot.send_info_message(
-                        f"✅ <b>StreetEasy Calibration Complete — Top {sent_count} Active Listings Sent</b>\n"
+                        f"✅ <b>StreetEasy Calibration Complete — Top {sent_count} Verified Active Listings Sent</b>\n"
                         f"• 🏢 Active StreetEasy Inventory Baselined as Seen: <b>{total_seen_now} apartments</b>\n"
                         "• 👍/👎 Rate these cards at your pace using <b>[ YES 👍 ]</b> or <b>[ NO 👎 ]</b> to calibrate my scoring &amp; learned rules.\n"
                         "• 🔒 <b>StreetEasy New-Listings-Only Mode Active:</b> Going forward, all existing inventory is skipped and I will <b>only</b> send you brand-new StreetEasy listings!"
                     )
                 else:
                     await self.bot.send_info_message(
-                        "ℹ️ <b>StreetEasy Calibration Check:</b> No unrated active StreetEasy listings were available to send, "
-                        "and New-Listings-Only mode is active for upcoming scans."
+                        "⚠️ <b>StreetEasy Calibration Warning:</b> No verified active listings could be scored on this run; will retry automatically."
                     )
 
             logger.info(
-                "StreetEasy calibration batch finished: scraped=%d, newly_evaluated=%d, baselined=%d, calibration_sent=%d",
+                "StreetEasy calibration batch finished: scraped=%d, verified_evaluated=%d, baselined=%d, calibration_sent=%d",
                 len(candidates),
                 newly_evaluated,
                 baselined_count,
@@ -308,8 +367,9 @@ class UESRentalAgentRunner:
         1. Scrape active StreetEasy UES candidates.
         2. Skip any listing already seen by ID or canonical NYC address+unit key.
         3. Filter brand-new listings against the user's live SearchCriteriaProfile (Stage 1).
-        4. Evaluate & score via Gemini Vision with dynamic feedback memory injection (Stage 2).
-        5. Rank qualifying new apartments #1 to #N (capped at max_alerts_per_scan) and send in ranked order.
+        4. Verify live StreetEasy link & enrich detail page (floorplans, photos, description, amenities).
+        5. Evaluate & score via Gemini Vision with dynamic feedback memory injection (Stage 2).
+        6. Rank qualifying new apartments #1 to #N (capped at max_alerts_per_scan) and send in ranked order.
         """
         async with self._scan_lock:
             report = ScanCycleReport()
@@ -317,9 +377,11 @@ class UESRentalAgentRunner:
             candidates = await self.collect_candidates()
             seen_ids, seen_addr_keys = self.storage.get_seen_identifiers()
             report.scraped_count = len(candidates)
-            logger.info("StreetEasy scan cycle started: %d active UES listings checked", len(candidates))
+            logger.info(
+                "StreetEasy scan cycle started: %d active UES listings checked", len(candidates)
+            )
 
-            qualifying_batch: list[EvaluatedListing] = []
+            new_stage1_passed: list[Listing] = []
 
             for listing in candidates:
                 addr_key = canonicalize_nyc_address_key(listing.address, listing.unit, listing.url)
@@ -327,7 +389,6 @@ class UESRentalAgentRunner:
                     report.already_seen_count += 1
                     continue
 
-                # Stage 1: Fast zero-cost deterministic pre-filter using live criteria profile
                 verdict = prefilter_listing(
                     listing=listing,
                     min_bedrooms=criteria.min_bedrooms,
@@ -346,10 +407,16 @@ class UESRentalAgentRunner:
                     )
                     continue
 
-                if report.gemini_evaluated_count > 0 and self.config.gemini_api_key:
-                    await asyncio.sleep(2.0)
+                new_stage1_passed.append(listing)
 
-                # Stage 2: Gemini multimodal vision evaluation + 100-Point Ranking Rubric
+            verified_new = await self._enrich_and_verify_batch(new_stage1_passed)
+            qualifying_batch: list[EvaluatedListing] = []
+
+            for listing in verified_new:
+                addr_key = canonicalize_nyc_address_key(listing.address, listing.unit, listing.url)
+                if report.gemini_evaluated_count > 0 and self.config.gemini_api_key:
+                    await asyncio.sleep(1.8)
+
                 evaluation = await asyncio.to_thread(self.evaluator.evaluate_listing, listing)
                 report.gemini_evaluated_count += 1
 
@@ -380,7 +447,6 @@ class UESRentalAgentRunner:
 
                 qualifying_batch.append(evaluated_record)
 
-            # Rank qualifying brand-new StreetEasy apartments from #1 (highest rubric score) to #N
             qualifying_batch.sort(
                 key=lambda item: (
                     item.evaluation.overall_score,
@@ -544,10 +610,10 @@ class UESRentalAgentRunner:
                     criteria = self.storage.get_criteria_profile()
                     if not (
                         criteria.calibration_completed
-                        and criteria.streeteasy_calibration_v2_completed
+                        and criteria.streeteasy_calibration_v3_completed
                     ):
                         logger.info(
-                            "StreetEasy v2 calibration pending — purging legacy sources and running Top-%d StreetEasy calibration batch...",
+                            "StreetEasy v3 calibration pending — running live-verified Top-%d StreetEasy calibration batch...",
                             criteria.calibration_batch_size,
                         )
                         await self.run_calibration_batch(limit=criteria.calibration_batch_size)

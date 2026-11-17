@@ -54,7 +54,7 @@ class AgentConfig:
     min_bedrooms: float = 3.0
     max_monthly_rent: int | None = None
     scan_interval_minutes: int = 30
-    max_images_per_listing: int = 4
+    max_images_per_listing: int = 5
     enable_demo_mode: bool = False
 
     target_neighborhoods: Tuple[str, ...] = (
@@ -139,9 +139,9 @@ class AgentConfig:
             scan_interval = 30
 
         try:
-            max_images = max(1, min(8, int(os.getenv("MAX_IMAGES_PER_LISTING", "4"))))
+            max_images = max(1, min(8, int(os.getenv("MAX_IMAGES_PER_LISTING", "5"))))
         except ValueError:
-            max_images = 4
+            max_images = 5
 
         enable_demo = os.getenv("ENABLE_DEMO_MODE", "false").strip().lower() in (
             "1",

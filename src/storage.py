@@ -24,6 +24,7 @@ from src.models import (
     utc_now_iso,
 )
 from src.scrapers.base import canonicalize_nyc_address_key
+from src.scrapers.streeteasy import is_known_mock_streeteasy_url
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,10 @@ class StorageBackend(ABC):
     @abstractmethod
     def purge_non_streeteasy_listings(self) -> int:
         """Delete any stored listings not sourced from StreetEasy and return count removed."""
+
+    @abstractmethod
+    def purge_all_listings_for_recalibration(self) -> int:
+        """Clear all stored listing records prior to a fresh StreetEasy recalibration while preserving feedback memory."""
 
     def save_baseline_seen_listing(self, listing: Listing, reason: str) -> None:
         """
@@ -322,12 +327,21 @@ class LocalJSONStorage(StorageBackend):
             lid
             for lid, raw in state["listings"].items()
             if str((raw.get("listing") or {}).get("source") or "") != "StreetEasy"
+            or is_known_mock_streeteasy_url(str((raw.get("listing") or {}).get("url") or ""))
         ]
         if non_se_ids:
             for lid in non_se_ids:
                 del state["listings"][lid]
             self._write_state(state)
         return len(non_se_ids)
+
+    def purge_all_listings_for_recalibration(self) -> int:
+        state = self._read_state()
+        removed = len(state["listings"])
+        if removed > 0:
+            state["listings"] = {}
+            self._write_state(state)
+        return removed
 
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
         state = self._read_state()
@@ -361,7 +375,9 @@ class LocalJSONStorage(StorageBackend):
         items = [
             item
             for item in items
-            if item.listing.source == "StreetEasy" and item.evaluation.overall_score > 0
+            if item.listing.source == "StreetEasy"
+            and not is_known_mock_streeteasy_url(item.listing.url)
+            and item.evaluation.overall_score > 0
         ]
         items.sort(key=lambda x: x.evaluation.overall_score, reverse=True)
         return items[:limit]
@@ -546,6 +562,23 @@ class SupabaseStorage(StorageBackend):
         )
         resp.raise_for_status()
         deleted = resp.json() if resp.content else []
+        count = len(deleted) if isinstance(deleted, list) else 0
+        # Also remove any synthetic /test_alert mock row that had source='StreetEasy'
+        mock_resp = self._client.delete(
+            f"{self.rest_url}/listings",
+            params={"listing_id": "in.(se:carnegie-hill-1185-park-15b,se:lenox-hill-200-e79-18a,se:lenox-hill-315-e68-8d,se:uws-155-w72-12a)"},
+        )
+        mock_resp.raise_for_status()
+        mock_del = mock_resp.json() if mock_resp.content else []
+        return count + (len(mock_del) if isinstance(mock_del, list) else 0)
+
+    def purge_all_listings_for_recalibration(self) -> int:
+        resp = self._client.delete(
+            f"{self.rest_url}/listings",
+            params={"listing_id": "neq.__keep_none__"},
+        )
+        resp.raise_for_status()
+        deleted = resp.json() if resp.content else []
         return len(deleted) if isinstance(deleted, list) else 0
 
     def save_evaluated_listing(self, evaluated: EvaluatedListing) -> None:
@@ -643,11 +676,16 @@ class SupabaseStorage(StorageBackend):
                 "source": "eq.StreetEasy",
                 "overall_score": "gt.0",
                 "order": "overall_score.desc",
-                "limit": str(limit),
+                "limit": str(limit + 5),
             },
         )
         resp.raise_for_status()
-        return [self._row_to_evaluated_listing(r) for r in resp.json()]
+        items = [
+            self._row_to_evaluated_listing(r)
+            for r in resp.json()
+            if not is_known_mock_streeteasy_url(str(r.get("url") or ""))
+        ]
+        return items[:limit]
 
     def get_criteria_profile(self) -> SearchCriteriaProfile:
         try:

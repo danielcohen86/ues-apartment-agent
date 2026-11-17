@@ -485,4 +485,83 @@ async def test_streeteasy_only_runner_purges_legacy_craigslist_and_upgrades_mode
     assert purged == 1
     assert storage.is_listing_seen("cl:legacy-1") is False
 
+    # Seed synthetic /test_alert mock row with source='StreetEasy' and broken mock URL
+    fake_mock = Listing(
+        listing_id="se:carnegie-hill-1185-park-15b",
+        source="StreetEasy",
+        url="https://streeteasy.com/building/1185-park-avenue-new_york/15b",
+        address="1185 Park Avenue",
+        unit="#15B",
+        neighborhood="Carnegie Hill",
+        price=13500,
+        bedrooms=3.0,
+        bathrooms=3.0,
+        description="Synthetic demo card",
+    )
+    storage.save_evaluated_listing(
+        EvaluatedListing(
+            listing=fake_mock,
+            evaluation=prod_runner.evaluator.evaluate_listing(fake_mock),
+            alerted=True,
+        )
+    )
+    assert storage.get_top_evaluated_listings(limit=10) == []
+    assert storage.purge_non_streeteasy_listings() == 1
+
+
+def test_markdown_new_format_and_detail_page_link_verification() -> None:
+    from src.scrapers.streeteasy import StreetEasyUESScraper, parse_streeteasy_detail_markdown
+
+    md_new_sample = """
+# 61 All Upper East Side, Manhattan NY Apartments for Rent under $25,000
+
+- New development
+
+  Rental unit in Astoria [11-14 35th Avenue #918](https://streeteasy.com/building/nova-astoria/918?infeed=1)SaveListing actions$7,800base rent
+  - 3 beds
+  - 2.5 baths
+  - \\- ft²
+  Listing by EXR [Sponsored](https://streeteasy.com/building/nova-astoria/918?infeed=1)Image 1 of 32
+- Rental unit in Lenox Hill [356 East 78th Street #26B](https://streeteasy.com/building/maison-78/26b)SaveListing actions$22,400base rent
+  - 3 beds
+  - 3 baths
+  - 1,850 ft²
+  Listing by Greystar [![356 East 78th Street image 1 of 25](https://photos.zillowstatic.com/fp/abcd1234efgh5678ijkl9012mnop3456-p_e.webp)](https://streeteasy.com/building/maison-78/26b)Image 1 of 25
+"""
+    scraper = StreetEasyUESScraper()
+    items, tot = scraper.parse_jina_markdown(md_new_sample)
+    assert tot == 61
+    # Astoria ?infeed=1 Sponsored card is dropped, and Sponsored badge does NOT bleed into the next Lenox Hill card
+    assert len(items) == 1
+    assert items[0].address == "356 East 78th Street"
+    assert items[0].unit == "#26B"
+    assert items[0].floor_info == "26th Floor"
+    assert len(items[0].image_urls) == 1
+
+    # 404 broken page must be flagged valid=False
+    broken_404 = "Title: Converted Content\n\nHmmm...\nWe can't find that page\n" + ("x" * 1500)
+    res_404 = parse_streeteasy_detail_markdown(broken_404)
+    assert res_404["reachable"] is True
+    assert res_404["valid"] is False
+
+    # Valid detail page extracts floorplan, photos, About text, and Home features
+    valid_detail = (
+        "400 East 67th Street #27B\n1,964 ft²\n3 beds\n3.5 baths\n"
+        "![photo 1](https://photos.zillowstatic.com/fp/11112222333344445555666677778888-se_large_800_400.webp)\n"
+        "![floor plan 1](https://photos.zillowstatic.com/fp/ffff0000eeee1111dddd2222cccc3333-se_extra_large_1500_800.webp)\n"
+        "## About\nSun-drenched corner 3BR condo with open chef's island kitchen.\n"
+        "## Home features\n- Central air\n- Washer/dryer\n"
+        "## Building amenities\n- Doorman\n- Children's playroom\n"
+        "## Property history\n| 7/11/2019 | $16,000 | No longer available |\n"
+        + (" " * 1200)
+    )
+    res_ok = parse_streeteasy_detail_markdown(valid_detail)
+    assert res_ok["valid"] is True
+    assert res_ok["sqft"] == 1964
+    assert len(res_ok["floorplan_urls"]) == 1
+    assert len(res_ok["photo_urls"]) == 1
+    assert "open chef's island kitchen" in res_ok["about_text"]
+    assert "Washer/dryer" in res_ok["features"]
+
+
 

@@ -85,10 +85,11 @@ Calibrate scores honestly across the full spectrum so standout homes score 86–
    - 0–14 pts: Cramped secondary bedrooms, choppy hallway-heavy layout, or undersized living area.
 
 4. `learned_preference_points` (0 to 25 pts — Learned Preference Fit):
-   - 22–25 pts: Strong match to prior `[YES 👍]` votes (or, before votes exist: prime Carnegie Hill / Lenox Hill / prime Yorkville block, luxury Condo / New Development / Full-Service Doorman building, crisp modern finishes, and strong rent-to-quality value).
+   - Measures micro-location, building quality/amenities, rent-to-value ratio, and alignment with the user's historical `[YES 👍]` / `[NO 👎]` feedback votes (do NOT double-penalize kitchen or floor height here — those are already scored in `kitchen_points` and `light_points`!).
+   - 22–25 pts: Strong match to prior `[YES 👍]` votes (or, when no votes exist yet: prime Carnegie Hill / Lenox Hill / prime Yorkville block, luxury Condo / New Development / Full-Service Doorman building, crisp modern finishes, and strong value relative to budget).
    - 18–21 pts: Good UES location, full-service building, fair market value for the asking rent.
-   - 13–17 pts: Less convenient fringe block, older walk-up/dated finishes, or weak value near top of budget.
-   - 0–12 pts: Violates one or more learned `[NO 👎]` rejection rules or standing custom rules (fails Stage 1).
+   - 13–17 pts: Less convenient fringe block, walk-up/limited building amenities, or stretched price-to-finish value.
+   - 0–12 pts: Directly violates an explicit user `[NO 👎]` rejection vote or custom `/add_rule` rule in Active Training Memory.
 
 Set `overall_score = kitchen_points + light_points + layout_points + learned_preference_points`.
 
@@ -153,7 +154,10 @@ class GeminiListingEvaluator:
         self.storage = storage
         self._client: genai.Client | None = None
         if config.gemini_api_key:
-            self._client = genai.Client(api_key=config.gemini_api_key)
+            self._client = genai.Client(
+                api_key=config.gemini_api_key,
+                http_options=types.HttpOptions(timeout=30_000),
+            )
 
     def _candidate_models(self) -> list[str]:
         """Return ordered list of live Gemini multimodal models with automatic fallback."""
@@ -236,14 +240,18 @@ class GeminiListingEvaluator:
 
             for model_idx, model_name in enumerate(models_to_try):
                 try:
+                    gen_cfg = types.GenerateContentConfig(
+                        temperature=0.1,
+                        response_mime_type="application/json",
+                        response_schema=EvaluationResult,
+                    )
+                    if "lite" not in model_name:
+                        gen_cfg.thinking_config = types.ThinkingConfig(thinking_budget=512)
+
                     response = self._client.models.generate_content(
                         model=model_name,
                         contents=contents,
-                        config=types.GenerateContentConfig(
-                            temperature=0.1,
-                            response_mime_type="application/json",
-                            response_schema=EvaluationResult,
-                        ),
+                        config=gen_cfg,
                     )
                     if response and response.text:
                         break
@@ -260,12 +268,16 @@ class GeminiListingEvaluator:
                             "503",
                             "UNAVAILABLE",
                             "500",
+                            "504",
+                            "DEADLINE_EXCEEDED",
+                            "Timeout",
+                            "timed out",
                         )
                     )
                     if is_transient_or_model_err and model_idx + 1 < len(models_to_try):
                         next_model = models_to_try[model_idx + 1]
                         logger.info(
-                            "Gemini model '%s' returned transient/availability error for %s; switching to '%s'...",
+                            "Gemini model '%s' returned transient/timeout error for %s; switching to '%s'...",
                             model_name,
                             listing.listing_id,
                             next_model,

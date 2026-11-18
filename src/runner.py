@@ -218,17 +218,15 @@ class UESRentalAgentRunner:
                     "calibration_sent": 0,
                 }
 
-            # Freshly scraped >= 5 live StreetEasy listings (or unit-test dry_run):
-            # Wipe any stale/mock/broken listing rows while keeping feedback_memory 100% intact.
-            purged = self.storage.purge_all_listings_for_recalibration()
+            # Remove only non-StreetEasy / mock rows while preserving all existing StreetEasy seen records.
+            purged = self.storage.purge_non_streeteasy_listings()
             if purged > 0:
                 logger.info(
-                    "Cleared %d previous listing rows for clean StreetEasy recalibration.",
+                    "Purged %d non-StreetEasy/mock listing rows prior to calibration.",
                     purged,
                 )
 
-            seen_ids: set[str] = set()
-            seen_addr_keys: set[str] = set()
+            seen_ids, seen_addr_keys = self.storage.get_seen_identifiers()
             newly_evaluated = 0
             baselined_count = 0
 
@@ -297,7 +295,18 @@ class UESRentalAgentRunner:
                 )
 
             all_evaluated = self.storage.get_top_evaluated_listings(limit=80)
-            all_evaluated.sort(
+            voted_ids = {f.listing_id for f in self.storage.get_all_feedback(limit=200)}
+            unalerted_pool = [
+                item
+                for item in all_evaluated
+                if not item.alerted and item.listing.listing_id not in voted_ids
+            ]
+            pool = (
+                unalerted_pool
+                if len(unalerted_pool) >= batch_limit
+                else [item for item in all_evaluated if item.listing.listing_id not in voted_ids]
+            )
+            pool.sort(
                 key=lambda item: (
                     item.evaluation.passes_qualifying_criteria(
                         require_open_island=criteria.require_open_island_kitchen,
@@ -309,7 +318,7 @@ class UESRentalAgentRunner:
                 ),
                 reverse=True,
             )
-            calibration_batch = all_evaluated[:batch_limit]
+            calibration_batch = pool[:batch_limit]
             total_to_send = len(calibration_batch)
 
             sent_count = 0
@@ -608,15 +617,28 @@ class UESRentalAgentRunner:
             while not self._stop_event.is_set():
                 try:
                     criteria = self.storage.get_criteria_profile()
-                    if not (
+                    is_calibrated = bool(
                         criteria.calibration_completed
                         and criteria.streeteasy_calibration_v3_completed
-                    ):
-                        logger.info(
-                            "StreetEasy v3 calibration pending — running live-verified Top-%d StreetEasy calibration batch...",
-                            criteria.calibration_batch_size,
-                        )
-                        await self.run_calibration_batch(limit=criteria.calibration_batch_size)
+                    )
+                    if not is_calibrated:
+                        existing_seen_ids, _ = self.storage.get_seen_identifiers()
+                        if len(existing_seen_ids) >= 5:
+                            logger.info(
+                                "Found %d existing seen apartments in storage — locking New-Listings-Only mode without re-sending calibration.",
+                                len(existing_seen_ids),
+                            )
+                            criteria.calibration_completed = True
+                            criteria.streeteasy_calibration_v2_completed = True
+                            criteria.streeteasy_calibration_v3_completed = True
+                            self.storage.save_criteria_profile(criteria)
+                            await self.run_scan_cycle()
+                        else:
+                            logger.info(
+                                "Empty baseline detected — running initial Top-%d StreetEasy calibration batch...",
+                                criteria.calibration_batch_size,
+                            )
+                            await self.run_calibration_batch(limit=criteria.calibration_batch_size)
                     else:
                         await self.run_scan_cycle()
                 except Exception as exc:

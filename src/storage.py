@@ -688,17 +688,31 @@ class SupabaseStorage(StorageBackend):
         return items[:limit]
 
     def get_criteria_profile(self) -> SearchCriteriaProfile:
-        try:
-            resp = self._client.get(
-                f"{self.rest_url}/feedback_memory",
-                params={"listing_id": f"eq.{SYSTEM_CRITERIA_ROW_ID}", "select": "*"},
-            )
-            resp.raise_for_status()
-            rows = resp.json()
-            if rows and rows[0].get("listing_snapshot"):
-                return SearchCriteriaProfile.model_validate(rows[0]["listing_snapshot"])
-        except Exception as exc:
-            logger.debug("Using default SearchCriteriaProfile (%s)", exc)
+        import time
+
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = self._client.get(
+                    f"{self.rest_url}/feedback_memory",
+                    params={"listing_id": f"eq.{SYSTEM_CRITERIA_ROW_ID}", "select": "*"},
+                )
+                resp.raise_for_status()
+                rows = resp.json()
+                if rows and rows[0].get("listing_snapshot"):
+                    return SearchCriteriaProfile.model_validate(rows[0]["listing_snapshot"])
+                return self.default_criteria
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                raise
+            except Exception as exc:
+                logger.warning("Invalid SearchCriteriaProfile payload (%s); using defaults", exc)
+                return self.default_criteria
+        if last_exc:
+            raise last_exc
         return self.default_criteria
 
     def save_criteria_profile(self, profile: SearchCriteriaProfile) -> SearchCriteriaProfile:

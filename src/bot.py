@@ -843,11 +843,30 @@ class TelegramAgentBot:
             )
             return
 
+        scraped_count = raw_res.get("scraped_count", 0)
         alerts_sent = raw_res.get("high_conviction_alerts_sent", 0)
         evaluated_count = raw_res.get("gemini_evaluated_count", 0)
+
+        if scraped_count == 0:
+            seen_ids, _ = self.storage.get_seen_identifiers()
+            await self.app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ <b>StreetEasy Temporarily Rate-Limited This Scan</b>\n"
+                    "• 📥 Live Pages Fetched: <b>0</b> (upstream proxy cooldown)\n"
+                    f"• 🗂️ Stored Seen Memory (Safe &amp; Intact): <b>{len(seen_ids)} apartments</b>\n\n"
+                    "<i>Your seen history was not lost — tap below to retry in ~30 seconds.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔄 Retry StreetEasy Scan", callback_data="act|scan")]]
+                ),
+            )
+            return
+
         summary = (
             "✅ <b>Scan Complete — Funnel Breakdown:</b>\n"
-            f"• 📥 Candidates Found: <b>{raw_res.get('scraped_count', 0)}</b>\n"
+            f"• 📥 Candidates Found: <b>{scraped_count}</b>\n"
             f"• 🔄 Already Seen (Skipped): <b>{raw_res.get('already_seen_count', 0)}</b>\n"
             f"• 🚫 Filtered by Pre-Filter: <b>{raw_res.get('prefilter_rejected_count', 0)}</b>\n"
             f"• 🧠 Newly Evaluated by Gemini: <b>{evaluated_count}</b>\n"

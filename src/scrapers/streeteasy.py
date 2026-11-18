@@ -1,11 +1,13 @@
-"""StreetEasy Upper East Side (Carnegie Hill, Yorkville, Lenox Hill) 3+ BR live scraper + detail link verifier."""
+"""StreetEasy Upper East Side (Carnegie Hill, Yorkville, Lenox Hill) 3+ BR 3-provider scraper + live link verifier."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -42,14 +44,29 @@ CARD_TITLE_LINK_RE = re.compile(
     r"(?<!!)\[([^\[\]\n]+)\]\((https://streeteasy\.com/(?:building/[^/)\s?]+/[^)\s]+|rental/\d+[^)\s]*))\)"
 )
 
+BUILDING_TYPE_PATTERN = (
+    r"(?:Condo|Co-op|Condop|Rental unit|Townhouse|House|Multi-family|Loft|"
+    r"New development|Mixed-use Building|Building)"
+)
+
 # Anchored at \s*\Z so it matches both r.jina.ai (newline before link) and markdown.new (space before link)
 CARD_TYPE_NEIGH_RE = re.compile(
-    r"(Condo|Co-op|Condop|Rental unit|Townhouse|House|Multi-family|Loft|New development|Building)\s+in\s+([A-Za-z][A-Za-z \-]*?)\s*\Z",
+    rf"({BUILDING_TYPE_PATTERN})\s+in\s+([A-Za-z][A-Za-z \-]*?)\s*\Z",
+    re.I,
+)
+
+INLINE_TYPE_NEIGH_RE = re.compile(
+    rf"({BUILDING_TYPE_PATTERN})\s+in\s+([A-Za-z][A-Za-z \-]*)",
     re.I,
 )
 
 ZILLOW_IMAGE_RE = re.compile(
     r"!\[(?:Image\s+\d+:\s*)?([^\]]*)\]\((https://photos\.zillowstatic\.com/fp/([a-zA-Z0-9_-]+))-[^)\s.]+\.(?:webp|jpg|jpeg|png)\)"
+)
+
+ZILLOW_HASH_FROM_URL_RE = re.compile(
+    r"https://photos\.zillowstatic\.com/fp/([a-zA-Z0-9_-]+)-[^)\s.\"]+\.(?:webp|jpg|jpeg|png)",
+    re.I,
 )
 
 DETAIL_PHOTO_RE = re.compile(
@@ -70,23 +87,25 @@ def is_known_mock_streeteasy_url(url: str) -> bool:
 
 
 def split_streeteasy_title_address_and_unit(title: str, canonical_url: str = "") -> tuple[str, str]:
-    """Split '400 East 67th Street #27B' or '340 East 64th Street #10/11J' into address and unit."""
+    """Split '400 East 67th Street #27B', '340 East 64th Street #10/11J', or '127 East 69th Street RESIDENCE-4'."""
     cleaned = " ".join((title or "").split()).strip()
     m = re.match(
-        r"^(.*?)(?:\s+#|\s+Apt\.?\s+|\s+Unit\s+|\s+Residence\s+|,\s*#?)([A-Za-z0-9/-]+)$",
+        r"^(.*?)(?:\s+#|\s+Apt\.?\s+|\s+Unit\s+|\s+Residence(?:[-\s]+#?|\s+)|\s+Penthouse[-\s]+|,\s*#?)([A-Za-z0-9/-]+)$",
         cleaned,
         re.I,
     )
     if m:
         addr = m.group(1).strip().rstrip(",")
         raw_u = m.group(2).strip().lstrip("#")
+        if "penthouse" in cleaned.lower() and not raw_u.upper().startswith("PH"):
+            raw_u = f"PH{raw_u}"
         return addr, f"#{raw_u}"
 
     if canonical_url:
         u_match = re.search(r"streeteasy\.com/building/[^/]+/([^/?#]+)", canonical_url)
         if u_match:
             u_slug = u_match.group(1).strip().upper()
-            if u_slug and u_slug != "RENTAL" and len(u_slug) <= 10:
+            if u_slug and u_slug != "RENTAL" and len(u_slug) <= 12:
                 return cleaned, f"#{u_slug}"
 
     return cleaned, ""
@@ -128,13 +147,17 @@ def parse_streeteasy_detail_markdown(detail_md: str) -> dict[str, Any]:
     ):
         return {"reachable": True, "valid": False, "reason": "404 page not found on StreetEasy"}
 
-    # Check if top summary section (before Property history) marks unit as rented / off-market
     before_history = detail_md.split("## Property history")[0]
     top_listing_header = before_history.split("## About")[0]
-    if re.search(r"\b(?:no longer available|delisted|off[- ]market|rented)\b", top_listing_header, re.I):
-        return {"reachable": True, "valid": False, "reason": "Listing is no longer available on StreetEasy"}
+    if re.search(
+        r"\b(?:no longer available|delisted|off[- ]market|rented)\b", top_listing_header, re.I
+    ):
+        return {
+            "reachable": True,
+            "valid": False,
+            "reason": "Listing is no longer available on StreetEasy",
+        }
 
-    # Extract explicit floorplans (1500px) and interior gallery photos (960px)
     floorplan_urls: list[str] = []
     seen_fp: set[str] = set()
     for fp_m in DETAIL_FLOORPLAN_RE.finditer(before_history):
@@ -155,7 +178,6 @@ def parse_streeteasy_detail_markdown(detail_md: str) -> dict[str, Any]:
             if len(photo_urls) >= 6:
                 break
 
-    # Extract About / Home features / Building amenities / About the building sections
     about_text = ""
     m_about = re.search(
         r"##\s+About\s*\n+(.*?)(?=\n##\s+(?:Policies|Home features|Building amenities|About the building|Property history)|\Z)",
@@ -174,11 +196,15 @@ def parse_streeteasy_detail_markdown(detail_md: str) -> dict[str, Any]:
         )
         if m_sec:
             for line in m_sec.group(1).splitlines():
-                cleaned_line = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line).strip().lstrip("-*").strip()
+                cleaned_line = (
+                    re.sub(r"!\[[^\]]*\]\([^)]*\)", "", line).strip().lstrip("-*").strip()
+                )
                 if (
                     cleaned_line
                     and len(cleaned_line) <= 60
-                    and not cleaned_line.lower().startswith(("services and", "wellness and", "shared outdoor", "no info"))
+                    and not cleaned_line.lower().startswith(
+                        ("services and", "wellness and", "shared outdoor", "no info")
+                    )
                 ):
                     features_list.append(cleaned_line)
 
@@ -210,14 +236,97 @@ def parse_streeteasy_detail_markdown(detail_md: str) -> dict[str, Any]:
     }
 
 
+def parse_microlink_detail_html(main_html: str) -> dict[str, Any]:
+    """Parse StreetEasy detail-page <main> DOM HTML returned by api.microlink.io."""
+    if not main_html or len(main_html) < 800:
+        return {"reachable": False, "valid": True}
+
+    soup = BeautifulSoup(main_html, "html.parser")
+    full_text = soup.get_text("\n", strip=True)
+    lower_head = full_text[:2500].lower()
+    if "we can't find that page" in lower_head or "page not found" in lower_head:
+        return {"reachable": True, "valid": False, "reason": "404 page not found on StreetEasy"}
+
+    before_hist_text = full_text.split("Property history")[0]
+    top_header_text = before_hist_text.split("About")[0]
+    if re.search(
+        r"\b(?:no longer available|delisted|off[- ]market|rented)\b", top_header_text, re.I
+    ):
+        return {
+            "reachable": True,
+            "valid": False,
+            "reason": "Listing is no longer available on StreetEasy",
+        }
+
+    floorplan_urls: list[str] = []
+    photo_urls: list[str] = []
+    seen_fp: set[str] = set()
+    seen_ph: set[str] = set()
+
+    for img in soup.find_all("img"):
+        src = str(img.get("src") or "")
+        alt = str(img.get("alt") or "").lower()
+        hm = ZILLOW_HASH_FROM_URL_RE.search(src)
+        if not hm:
+            continue
+        h = hm.group(1)
+        if "floor" in alt and "plan" in alt:
+            if h not in seen_fp:
+                seen_fp.add(h)
+                floorplan_urls.append(
+                    f"https://photos.zillowstatic.com/fp/{h}-se_extra_large_1500_800.webp"
+                )
+        elif alt.startswith("photo ") or "image" in alt:
+            if h not in seen_ph and h not in seen_fp:
+                seen_ph.add(h)
+                photo_urls.append(f"https://photos.zillowstatic.com/fp/{h}-cc_ft_960.webp")
+
+    about_text = ""
+    for h2 in soup.find_all(["h2", "h3"]):
+        if h2.get_text(" ", strip=True).lower() == "about":
+            sec_parent = h2.find_parent(["section", "div"])
+            if sec_parent:
+                raw_sec = sec_parent.get_text(" ", strip=True)
+                about_text = re.sub(r"^About\s+", "", raw_sec, flags=re.I).strip()[:1600]
+            break
+
+    features_list: list[str] = []
+    for h2 in soup.find_all(["h2", "h3"]):
+        label = h2.get_text(" ", strip=True).lower()
+        if label in ("home features", "building amenities"):
+            sec_parent = h2.find_parent(["section", "div"])
+            if sec_parent:
+                for li in sec_parent.find_all("li"):
+                    t = li.get_text(" ", strip=True)
+                    if t and len(t) <= 60 and t not in features_list:
+                        features_list.append(t)
+
+    sqft_m = re.search(r"\b([\d,]+)\s*ft²", top_header_text)
+    sqft = parse_int_price(sqft_m.group(1)) if sqft_m else None
+
+    return {
+        "reachable": True,
+        "valid": True,
+        "floorplan_urls": floorplan_urls,
+        "photo_urls": photo_urls[:6],
+        "about_text": about_text,
+        "features": features_list,
+        "building_meta": "",
+        "sqft": sqft,
+    }
+
+
 class StreetEasyUESScraper(BaseScraper):
     """
     Scrapes live StreetEasy 3+ BR rental inventory for Upper East Side,
-    Carnegie Hill, Yorkville, and Lenox Hill using dual cloud-IP-resilient markdown engines
-    (markdown.new + r.jina.ai) plus live detail-page link verification & enrichment.
+    Carnegie Hill, Yorkville, and Lenox Hill using a 3-provider cloud-IP-resilient architecture:
+      1. r.jina.ai (with X-Target-Selector: main, 38s timeout, optional JINA_API_KEY, and 429 backoff)
+      2. api.microlink.io (headless browser DOM <main> HTML extractor)
+      3. markdown.new (Cloudflare Browser Rendering API)
     """
 
     source_name = "StreetEasy"
+    _provider_cooldowns: dict[str, float] = {}
 
     def __init__(
         self,
@@ -225,13 +334,22 @@ class StreetEasyUESScraper(BaseScraper):
         min_bathrooms: float = 2.0,
         max_monthly_rent: int = 25000,
         max_pages: int = 5,
-        timeout_seconds: float = 22.0,
+        timeout_seconds: float = 40.0,
     ) -> None:
         super().__init__(timeout_seconds=timeout_seconds)
         self.min_bedrooms = min_bedrooms
         self.min_bathrooms = min_bathrooms
         self.max_monthly_rent = max_monthly_rent
         self.max_pages = max_pages
+
+    @classmethod
+    def _is_provider_available(cls, name: str) -> bool:
+        return time.monotonic() >= cls._provider_cooldowns.get(name, 0.0)
+
+    @classmethod
+    def _mark_provider_cooldown(cls, name: str, seconds: float) -> None:
+        cls._provider_cooldowns[name] = time.monotonic() + seconds
+        logger.info("[StreetEasy] Provider '%s' placed on %.0fs rate-limit cooldown", name, seconds)
 
     def update_search_parameters(
         self,
@@ -264,83 +382,177 @@ class StreetEasyUESScraper(BaseScraper):
         encoded_filters = quote("|".join(filters), safe=":-,")
         return f"https://streeteasy.com/for-rent/ues/{encoded_filters}?sort_by=listed_desc&page={page}"
 
-    async def _fetch_markdown_dual_engine(
+    async def _fetch_via_jina(
+        self, client: httpx.AsyncClient, target_se_url: str, is_detail: bool = False
+    ) -> str | None:
+        if not self._is_provider_available("jina"):
+            return None
+
+        ua_headers: dict[str, str] = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/plain, text/markdown, */*;q=0.8",
+            "X-Target-Selector": "main",
+        }
+        jina_key = os.getenv("JINA_API_KEY", "").strip()
+        if jina_key:
+            ua_headers["Authorization"] = f"Bearer {jina_key}"
+
+        jina_url = f"https://r.jina.ai/{target_se_url}"
+        attempts = [{}] if is_detail else [{}, {"X-No-Cache": "true"}]
+
+        for idx, extra_h in enumerate(attempts):
+            try:
+                resp = await client.get(
+                    jina_url,
+                    headers={**ua_headers, **extra_h},
+                    timeout=38.0,
+                )
+                if resp.status_code == 200 and len(resp.text) > 1200:
+                    if "Access to this page has been denied" not in resp.text:
+                        return resp.text
+                    if is_detail:
+                        return None
+                elif resp.status_code in (429, 451):
+                    # On shared Render NAT IPs, Jina's 60s window may transiently trip; cooldown briefly
+                    self._mark_provider_cooldown("jina", 45.0)
+                    return None
+            except Exception as exc:
+                logger.debug("[StreetEasy] r.jina.ai attempt %d error on %s: %s", idx + 1, target_se_url, exc)
+            if idx + 1 < len(attempts):
+                await asyncio.sleep(1.5)
+        return None
+
+    async def _fetch_via_microlink_html(
         self, client: httpx.AsyncClient, target_se_url: str
     ) -> str | None:
-        """
-        Fetch StreetEasy markdown using dual independent cloud providers:
-        1. markdown.new POST API (Cloudflare Browser/Markdown — immune to Jina shared-IP rate limits)
-        2. r.jina.ai GET (with X-No-Cache fallback if blocked/cached)
-        """
+        if not self._is_provider_available("microlink"):
+            return None
+
+        try:
+            resp = await client.get(
+                "https://api.microlink.io/",
+                params={
+                    "url": target_se_url,
+                    "data.mainHtml.selector": "main",
+                    "data.mainHtml.type": "html",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30.0,
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                main_html = str((payload.get("data") or {}).get("mainHtml") or "")
+                if (
+                    len(main_html) > 1200
+                    and "Access to this page has been denied" not in main_html
+                ):
+                    return main_html
+            elif resp.status_code == 429:
+                self._mark_provider_cooldown("microlink", 1800.0)
+        except Exception as exc:
+            logger.debug("[StreetEasy] Microlink error on %s: %s", target_se_url, exc)
+        return None
+
+    async def _fetch_via_markdown_new(
+        self, client: httpx.AsyncClient, target_se_url: str
+    ) -> str | None:
+        if not self._is_provider_available("markdown_new"):
+            return None
+
         ua_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
             ),
         }
-
-        # Provider 1: markdown.new POST (preserves query params like ?sort_by=listed_desc&page=N + images)
         try:
             resp = await client.post(
                 "https://markdown.new/",
                 json={"url": target_se_url, "retain_images": True},
                 headers=ua_headers,
-                timeout=18.0,
+                timeout=20.0,
             )
             if resp.status_code == 200:
-                content_type = resp.headers.get("content-type", "").lower()
-                if "application/json" in content_type:
-                    payload = resp.json()
-                    md_text = str(payload.get("content") or "")
-                else:
-                    md_text = resp.text
-                if (
-                    len(md_text) > 1500
-                    and "Access to this page has been denied" not in md_text
-                ):
+                ct = resp.headers.get("content-type", "").lower()
+                md_text = str(resp.json().get("content") or "") if "application/json" in ct else resp.text
+                if len(md_text) > 1200 and "Access to this page has been denied" not in md_text:
                     return md_text
+            elif resp.status_code == 429:
+                self._mark_provider_cooldown("markdown_new", 1800.0)
+                return None
         except Exception as exc:
-            logger.debug("[StreetEasy] markdown.new POST fallback trigger for %s: %s", target_se_url, exc)
+            logger.debug("[StreetEasy] markdown.new POST error on %s: %s", target_se_url, exc)
 
-        # Provider 2: markdown.new GET (works cleanly for detail URLs without query params)
-        if "?" not in target_se_url:
+        if "?" not in target_se_url and self._is_provider_available("markdown_new"):
             try:
                 resp_get = await client.get(
                     f"https://markdown.new/{target_se_url}",
                     params={"retain_images": "true"},
                     headers=ua_headers,
-                    timeout=18.0,
-                )
-                if (
-                    resp_get.status_code == 200
-                    and len(resp_get.text) > 1500
-                    and "Access to this page has been denied" not in resp_get.text
-                ):
-                    return resp_get.text
-            except Exception as exc:
-                logger.debug("[StreetEasy] markdown.new GET error for %s: %s", target_se_url, exc)
-
-        # Provider 3: r.jina.ai (standard + X-No-Cache retry)
-        jina_url = f"https://r.jina.ai/{target_se_url}"
-        for extra_h in ({}, {"X-No-Cache": "true"}):
-            try:
-                resp_jina = await client.get(
-                    jina_url,
-                    headers={**ua_headers, "Accept": "text/plain, text/markdown, */*;q=0.8", **extra_h},
                     timeout=20.0,
                 )
                 if (
-                    resp_jina.status_code == 200
-                    and len(resp_jina.text) > 1500
-                    and "Access to this page has been denied" not in resp_jina.text
+                    resp_get.status_code == 200
+                    and len(resp_get.text) > 1200
+                    and "Access to this page has been denied" not in resp_get.text
                 ):
-                    return resp_jina.text
+                    return resp_get.text
+                if resp_get.status_code == 429:
+                    self._mark_provider_cooldown("markdown_new", 1800.0)
             except Exception as exc:
-                logger.debug("[StreetEasy] r.jina.ai error for %s: %s", target_se_url, exc)
-            await asyncio.sleep(1.0)
+                logger.debug("[StreetEasy] markdown.new GET error on %s: %s", target_se_url, exc)
 
-        logger.warning("[StreetEasy] Both markdown providers failed on %s", target_se_url)
         return None
+
+    async def _fetch_search_page_listings(
+        self, client: httpx.AsyncClient, page: int
+    ) -> tuple[list[Listing], int | None, bool]:
+        """
+        Fetch and parse a single StreetEasy search page across 3 independent cloud providers:
+        1. r.jina.ai (20 RPM rolling window, rich 4-slide card previews)
+        2. api.microlink.io (Vercel/Lambda headless browser DOM <main> HTML)
+        3. markdown.new (Cloudflare Browser Rendering)
+        Returns (listings, total_expected, fetched_ok).
+        """
+        se_url = self._build_raw_streeteasy_search_url(page=page)
+
+        # 1. Try r.jina.ai
+        md_jina = await self._fetch_via_jina(client, se_url, is_detail=False)
+        if md_jina:
+            items, tot = self.parse_jina_markdown(md_jina)
+            if items:
+                return items, tot, True
+
+        # 2. Try api.microlink.io DOM <main> HTML
+        html_ml = await self._fetch_via_microlink_html(client, se_url)
+        if html_ml:
+            items, tot = self.parse_microlink_search_html(html_ml)
+            if items:
+                return items, tot, True
+
+        # 3. Try markdown.new
+        md_new = await self._fetch_via_markdown_new(client, se_url)
+        if md_new:
+            items, tot = self.parse_jina_markdown(md_new)
+            if items:
+                return items, tot, True
+
+        # 4. Last-resort retry on r.jina.ai after waiting 12s for shared-IP 60s window reset
+        if page == 1:
+            logger.info("[StreetEasy] Waiting 12s for Jina shared-IP window reset on page 1...")
+            await asyncio.sleep(12.0)
+            self._provider_cooldowns.pop("jina", None)
+            md_retry = await self._fetch_via_jina(client, se_url, is_detail=False)
+            if md_retry:
+                items, tot = self.parse_jina_markdown(md_retry)
+                if items:
+                    return items, tot, True
+
+        logger.warning("[StreetEasy] All 3 providers failed on search page %d (%s)", page, se_url)
+        return [], None, False
 
     async def enrich_and_verify_listing(
         self, listing: Listing, client: httpx.AsyncClient | None = None
@@ -357,15 +569,30 @@ class StreetEasyUESScraper(BaseScraper):
             return False
 
         owns_client = client is None
-        http_client = client or httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+        http_client = client or httpx.AsyncClient(timeout=35.0, follow_redirects=True)
         try:
-            detail_md = await self._fetch_markdown_dual_engine(http_client, listing.url)
-            if not detail_md:
+            parsed: dict[str, Any] | None = None
+
+            # Try markdown.new first if not rate-limited, then Microlink DOM, then Jina
+            md_detail = await self._fetch_via_markdown_new(http_client, listing.url)
+            if md_detail:
+                parsed = parse_streeteasy_detail_markdown(md_detail)
+
+            if not parsed or not parsed.get("reachable"):
+                ml_html = await self._fetch_via_microlink_html(http_client, listing.url)
+                if ml_html:
+                    parsed = parse_microlink_detail_html(ml_html)
+
+            if not parsed or not parsed.get("reachable"):
+                jina_md = await self._fetch_via_jina(http_client, listing.url, is_detail=True)
+                if jina_md:
+                    parsed = parse_streeteasy_detail_markdown(jina_md)
+
+            if not parsed or not parsed.get("reachable"):
                 # Listing was just discovered on StreetEasy's live search page; keep search-card data
                 return True
 
-            parsed = parse_streeteasy_detail_markdown(detail_md)
-            if parsed.get("reachable") and not parsed.get("valid"):
+            if not parsed.get("valid"):
                 logger.info(
                     "[StreetEasy] Dropping dead/off-market link %s (%s)",
                     listing.url,
@@ -374,7 +601,9 @@ class StreetEasyUESScraper(BaseScraper):
                 return False
 
             if parsed.get("floorplan_urls"):
-                existing_fp = [u for u in listing.floorplan_urls if u not in parsed["floorplan_urls"]]
+                existing_fp = [
+                    u for u in listing.floorplan_urls if u not in parsed["floorplan_urls"]
+                ]
                 listing.floorplan_urls = list(parsed["floorplan_urls"]) + existing_fp
 
             if parsed.get("photo_urls"):
@@ -415,17 +644,17 @@ class StreetEasyUESScraper(BaseScraper):
         ) as client:
             for page in range(1, self.max_pages + 1):
                 if page > 1:
-                    await asyncio.sleep(0.6)
-                se_url = self._build_raw_streeteasy_search_url(page=page)
-                md = await self._fetch_markdown_dual_engine(client, se_url)
-                if not md:
+                    await asyncio.sleep(1.0)
+                page_listings, page_total, ok = await self._fetch_search_page_listings(
+                    client, page=page
+                )
+                if not ok:
                     consecutive_failures += 1
                     if consecutive_failures >= 2:
                         break
                     continue
 
                 consecutive_failures = 0
-                page_listings, page_total = self.parse_jina_markdown(md)
                 if page_total is not None and total_expected is None:
                     total_expected = page_total
 
@@ -454,8 +683,154 @@ class StreetEasyUESScraper(BaseScraper):
         )
         return list(discovered.values())
 
+    def parse_microlink_search_html(self, main_html: str) -> tuple[list[Listing], int | None]:
+        """Parse StreetEasy search <main> DOM HTML returned by api.microlink.io into Listing objects."""
+        soup = BeautifulSoup(main_html, "html.parser")
+        h1 = soup.find("h1")
+        h1_text = h1.get_text(" ", strip=True) if h1 else ""
+        tot_m = re.search(r"^(\d+)\s+.*?\bApartments?\s+for\s+Rent", h1_text, re.I)
+        total_expected = int(tot_m.group(1)) if tot_m else None
+
+        listings: dict[str, Listing] = {}
+        unit_href_re = re.compile(
+            r"^https://streeteasy\.com/(?:building/[^/?#]+/[^?#]+|rental/\d+)"
+        )
+
+        for li in soup.find_all("li"):
+            matching_links = [
+                a for a in li.find_all("a", href=True) if unit_href_re.match(str(a["href"]))
+            ]
+            if not matching_links:
+                continue
+
+            raw_url = str(matching_links[0]["href"]).strip()
+            if "infeed=1" in raw_url.lower() or is_known_mock_streeteasy_url(raw_url):
+                continue
+
+            li_text = li.get_text(" ", strip=True)
+            if re.search(r"\bSponsored\b", li_text) or "Near All Upper East Side" in li_text:
+                continue
+
+            title_a = None
+            for a in matching_links:
+                txt = a.get_text(" ", strip=True)
+                if txt and not txt.startswith(
+                    ("Featured", "Enhanced", "3D tour", "Video", "Live", "Open:", "Sponsored", "Image ")
+                ):
+                    title_a = a
+                    break
+            if title_a is None:
+                continue
+
+            raw_title = title_a.get_text(" ", strip=True)
+            canonical_url = raw_url.split("?")[0].split("#")[0].rstrip("/")
+            pre_title = li_text.split(raw_title, 1)[0]
+
+            building_type = "Apartment"
+            card_neigh_raw = ""
+            tm = INLINE_TYPE_NEIGH_RE.search(pre_title)
+            if tm:
+                building_type = tm.group(1).strip()
+                card_neigh_raw = tm.group(2).strip()
+
+            address, unit = split_streeteasy_title_address_and_unit(raw_title, canonical_url)
+            if not address or not is_strict_ues_street_bounds(address, card_neigh_raw):
+                continue
+
+            neighborhood = infer_ues_subneighborhood(address, card_neigh_raw or "Upper East Side")
+
+            base_rent_m = re.search(r"\$([\d,]+)\s*base\s*rent", li_text, re.I)
+            if base_rent_m:
+                price = parse_int_price(base_rent_m.group(1))
+            else:
+                any_price_m = re.search(r"\$([\d,]+)", li_text)
+                price = parse_int_price(any_price_m.group(1)) if any_price_m else 0
+            if price <= 0:
+                continue
+
+            beds_m = re.search(r"(\d+(?:\.\d+)?)\s*beds?\b", li_text, re.I)
+            beds = float(beds_m.group(1)) if beds_m else 0.0
+            if beds < self.min_bedrooms:
+                continue
+
+            full_half_m = re.search(
+                r"(\d+)\s*full(?:,\s*(\d+)\s*half)?\s*baths?\b", li_text, re.I
+            )
+            if full_half_m:
+                baths = float(full_half_m.group(1)) + (
+                    0.5 * float(full_half_m.group(2)) if full_half_m.group(2) else 0.0
+                )
+            else:
+                baths_m = re.search(r"(\d+(?:\.\d+)?)\s*baths?\b", li_text, re.I)
+                baths = float(baths_m.group(1)) if baths_m else 1.0
+
+            sqft_m = re.search(r"([\d,]+)\s*ft²", li_text)
+            sqft = parse_int_price(sqft_m.group(1)) if sqft_m else None
+
+            photo_urls: list[str] = []
+            floorplan_urls: list[str] = []
+            seen_hashes: set[str] = set()
+            for img in li.find_all("img"):
+                src = str(img.get("src") or "")
+                alt = str(img.get("alt") or "")
+                hm = ZILLOW_HASH_FROM_URL_RE.search(src)
+                if not hm:
+                    continue
+                h = hm.group(1)
+                if h in seen_hashes:
+                    continue
+                seen_hashes.add(h)
+                hi_res_url = f"https://photos.zillowstatic.com/fp/{h}-cc_ft_960.webp"
+                pos_m = re.search(r"image\s+(\d+)\s+of\s+(\d+)", alt, re.I)
+                if pos_m and int(pos_m.group(1)) == int(pos_m.group(2)) and int(pos_m.group(2)) >= 5:
+                    floorplan_urls.append(hi_res_url)
+                else:
+                    photo_urls.append(hi_res_url)
+
+            _, floor_label = infer_nyc_floor_from_unit(unit, f"{building_type} {raw_title}")
+            amenities: list[str] = []
+            if building_type.lower() in ("condo", "new development", "condop"):
+                amenities.append(building_type.title())
+            if "new development" in pre_title.lower() and "New Development" not in amenities:
+                amenities.append("New Development")
+            if "3d tour" in li_text.lower():
+                amenities.append("3D Tour")
+
+            path_slug = canonical_url.split("streeteasy.com/")[-1]
+            path_slug = re.sub(r"^(?:building|rental)/", "", path_slug)
+            clean_id_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", path_slug).strip("-").lower()
+            listing_id = f"se:{clean_id_slug}"
+
+            desc_parts = [
+                f"StreetEasy Verified {building_type} in {neighborhood}: {address} {unit}".strip(),
+                f"${price:,}/mo ({beds:g} BR / {baths:g} BA"
+                + (f", {sqft:,} sq ft)" if sqft else ")"),
+            ]
+            if floor_label:
+                desc_parts.append(f"Inferred Floor Level: {floor_label}")
+
+            listings[listing_id] = Listing(
+                listing_id=listing_id,
+                source=self.source_name,
+                url=canonical_url,
+                address=address,
+                unit=unit,
+                neighborhood=neighborhood,
+                price=price,
+                bedrooms=beds,
+                bathrooms=baths,
+                sqft=sqft,
+                floor_info=floor_label,
+                description=" | ".join(desc_parts),
+                amenities=amenities,
+                image_urls=photo_urls,
+                floorplan_urls=floorplan_urls,
+            )
+
+        return list(listings.values()), total_expected
+
     def parse_jina_markdown(self, markdown_text: str) -> tuple[list[Listing], int | None]:
-        """Parse StreetEasy search results markdown (from markdown.new or r.jina.ai) into Listing objects."""
+        """Parse StreetEasy search results markdown (from r.jina.ai or markdown.new) into Listing objects."""
         total_match = re.search(
             r"^#\s+(\d+)\s+.*?\bApartments?\s+for\s+Rent",
             markdown_text,
@@ -470,11 +845,9 @@ class StreetEasyUESScraper(BaseScraper):
             raw_title = match.group(1).strip()
             raw_url = match.group(2).strip()
 
-            # Reject sponsored out-of-neighborhood in-feed ads (?infeed=1) and synthetic demo links
             if "infeed=1" in raw_url.lower() or is_known_mock_streeteasy_url(raw_url):
                 continue
 
-            # Clip prefix strictly after the previous card's ")Image X of Y" footer so Sponsored badges never bleed over
             prefix_start = matches[idx - 1].end() if idx > 0 else max(0, match.start() - 260)
             raw_prefix = markdown_text[max(prefix_start, match.start() - 320) : match.start()]
             prefix_text = re.split(r"\)Image\s+\d+\s+of\s+\d+", raw_prefix)[-1]
@@ -488,12 +861,10 @@ class StreetEasyUESScraper(BaseScraper):
                 else min(len(markdown_text), match.end() + 2200)
             )
             card_body = markdown_text[match.end() : card_end]
-            # Also check if this card itself has a Sponsored footer before its own ")Image 1 of N"
             own_card_segment = re.split(r"\)Image\s+\d+\s+of\s+\d+", card_body, maxsplit=1)[0]
             if re.search(r"\bSponsored\b", own_card_segment):
                 continue
 
-            # Extract building type & neighborhood immediately before [Address #Unit]
             building_type = "Apartment"
             card_neigh_raw = ""
             tm = CARD_TYPE_NEIGH_RE.search(prefix_text)
@@ -508,7 +879,6 @@ class StreetEasyUESScraper(BaseScraper):
 
             neighborhood = infer_ues_subneighborhood(address, card_neigh_raw or "Upper East Side")
 
-            # Parse base rent + optional net-effective / concession details
             base_rent_m = re.search(r"\$([\d,]+)\s*base\s*rent", own_card_segment, re.I)
             if base_rent_m:
                 price = parse_int_price(base_rent_m.group(1))
@@ -519,7 +889,6 @@ class StreetEasyUESScraper(BaseScraper):
             if price <= 0:
                 continue
 
-            # Parse beds, baths, sqft
             beds_m = re.search(r"(\d+(?:\.\d+)?)\s*beds?\b", own_card_segment, re.I)
             beds = float(beds_m.group(1)) if beds_m else 0.0
             if beds < self.min_bedrooms:

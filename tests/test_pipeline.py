@@ -564,4 +564,68 @@ def test_markdown_new_format_and_detail_page_link_verification() -> None:
     assert "Washer/dryer" in res_ok["features"]
 
 
+def test_microlink_dom_search_and_detail_parsers() -> None:
+    from src.scrapers.streeteasy import (
+        StreetEasyUESScraper,
+        parse_microlink_detail_html,
+        split_streeteasy_title_address_and_unit,
+    )
+
+    assert split_streeteasy_title_address_and_unit(
+        "127 East 69th Street RESIDENCE-4",
+        "https://streeteasy.com/building/127-east-69-street-new_york/residence4",
+    ) == ("127 East 69th Street", "#4")
+
+    search_main_html = """
+    <main>
+      <h1>62 All Upper East Side, Manhattan NY Apartments for Rent under $25,000</h1>
+      <ul>
+        <li>
+          <span>Mixed-use Building in Lenox Hill</span>
+          <a href="https://streeteasy.com/building/maison-78/26b?featured=1">356 East 78th Street #26B</a>
+          <span>$22,400 base rent</span>
+          <ul><li>3 beds</li><li>3 baths</li><li>1,850 ft²</li></ul>
+          <a href="https://streeteasy.com/building/maison-78/26b?featured=1">
+            <img alt="356 East 78th Street image 1 of 25" src="https://photos.zillowstatic.com/fp/26a488872e028c7dc9004b338baaff16-p_e.webp" />
+          </a>
+        </li>
+        <li>
+          <span>Rental unit in Astoria</span>
+          <a href="https://streeteasy.com/building/nova-astoria/918?infeed=1">11-14 35th Avenue #918</a>
+          <span>$7,800 base rent • 3 beds • 2.5 baths • Sponsored</span>
+        </li>
+      </ul>
+    </main>
+    """
+    scraper = StreetEasyUESScraper()
+    items, tot = scraper.parse_microlink_search_html(search_main_html)
+    assert tot == 62
+    assert len(items) == 1
+    assert items[0].listing_id == "se:maison-78-26b"
+    assert items[0].address == "356 East 78th Street"
+    assert items[0].unit == "#26B"
+    assert items[0].price == 22400
+    assert items[0].sqft == 1850
+    assert items[0].image_urls == [
+        "https://photos.zillowstatic.com/fp/26a488872e028c7dc9004b338baaff16-cc_ft_960.webp"
+    ]
+
+    detail_html = (
+        "<main><div>400 East 67th Street #27B • 1,964 ft²</div>"
+        "<img alt='photo 1' src='https://photos.zillowstatic.com/fp/29545326f53a92eb25c837bee017304e-se_large_800_400.webp'/>"
+        "<img alt='floor plan 1' src='https://photos.zillowstatic.com/fp/c6468c60efdd4d1a59dda9451391e375-se_extra_large_1500_800.webp'/>"
+        "<section><h2>About</h2><p>Corner 3BR in Lenox Hill with open island kitchen.</p></section>"
+        "<section><h2>Home features</h2><ul><li>Washer/dryer</li><li>Central air</li></ul></section>"
+        + (" " * 800)
+        + "</main>"
+    )
+    det = parse_microlink_detail_html(detail_html)
+    assert det["valid"] is True
+    assert det["sqft"] == 1964
+    assert len(det["floorplan_urls"]) == 1
+    assert len(det["photo_urls"]) == 1
+    assert "Washer/dryer" in det["features"]
+
+
+
 
